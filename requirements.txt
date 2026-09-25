@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+stripe
+anthropic
+requests
+python-multipart
+python-dotenv
