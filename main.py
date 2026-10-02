@@ -1013,5 +1013,78 @@ async def admin_delete_company(api_key: str, x_admin_token: OptionalHeader = Non
     raise HTTPException(status_code=404, detail="مفتاح الـ API غير موجود.")
 
 
+class OAuthLoginRequest(BaseModel):
+    """نموذج طلب تسجيل الدخول عبر Google OAuth."""
+    id_token: str
+
+
+@app.post("/enterprise/oauth-login")
+def oauth_login(payload: OAuthLoginRequest):
+    """يتحقق من توكن Google ويسجل الدخول أو ينشئ حساب تجريبي جديد تلقائياً."""
+    try:
+        resp = requests.get(
+            f"https://oauth2.googleapis.com/tokeninfo?id_token={payload.id_token}",
+            timeout=10
+        )
+        if resp.status_code != 200:
+            raise HTTPException(
+                status_code=401,
+                detail="توكن Google غير صالح أو منتهي الصلاحية."
+            )
+
+        user_info = resp.json()
+        email = user_info.get("email")
+        name = user_info.get("name", email.split("@")[0] if email else "مستخدم Google")
+
+        if not email:
+            raise HTTPException(
+                status_code=400,
+                detail="البريد الإلكتروني غير متوفر من حساب Google."
+            )
+
+        existing_key, existing_company = _find_company_by_email(email)
+        if existing_company:
+            return {
+                "status": "success",
+                "message": "تم تسجيل الدخول بنجاح.",
+                "company": existing_company["name"],
+                "plan": existing_company["plan"],
+                "api_key": existing_key,
+                **trial_status(existing_company)
+            }
+
+        trial_ends_at = (
+            datetime.now(timezone.utc) + timedelta(days=TRIAL_DAYS)
+        ).isoformat()
+        api_key = f"google_key_{uuid.uuid4().hex}"
+
+        DB_COMPANIES[api_key] = {
+            "name": name,
+            "plan": "pro",
+            "email": email,
+            "file_data": "",
+            "usage": {},
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "active": True,
+            "trial": True,
+            "trial_ends_at": trial_ends_at,
+            "payment_method": None,
+        }
+        _save_db()
+
+        return {
+            "status": "success",
+            "message": "تم إنشاء الحساب وتسجيل الدخول بنجاح.",
+            "company": name,
+            "api_key": api_key,
+            "trial_ends_at": trial_ends_at
+        }
+    except Exception as exc:
+        raise HTTPException(
+            status_code=401,
+            detail="فشل المصادقة عبر Google."
+        ) from exc
+
+
 if __name__ == "__main__":
     uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
