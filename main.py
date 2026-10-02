@@ -13,13 +13,14 @@
     ADMIN_TOKEN=...
 """
 
+import hashlib
 import json
 import os
 import secrets
 import smtplib
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Annotated
@@ -90,6 +91,7 @@ PAYPAL_API_BASE = os.environ.get(
 )
 # يطابق كل باقة بمبلغها (لتحديد الباقة من المبلغ المدفوع فعليًا)
 PLAN_PRICES_USD = {"basic": 29, "pro": 79, "enterprise": 199}
+TRIAL_DAYS = 7
 
 PAYPAL_LINKS = {
     "basic": "https://www.paypal.com/ncp/payment/23V3WQK4NVTG4",
@@ -180,6 +182,57 @@ PENDING_CLAIMS: dict = _load_json(PENDING_FILE)  # request_id -> claim
 def current_month_key() -> str:
     """مفتاح الشهر الحالي بصيغة YYYY-MM."""
     return datetime.now(timezone.utc).strftime("%Y-%m")
+
+
+def _hash_password(
+    password: str, salt_hex: str | None = None
+) -> tuple[str, str]:
+    """يشفّر كلمة السر بـ PBKDF2 (لا حاجة لمكتبات خارجية)."""
+    salt = bytes.fromhex(salt_hex) if salt_hex else os.urandom(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 200_000)
+    return digest.hex(), salt.hex()
+
+
+def _verify_password(password: str, salt_hex: str, hash_hex: str) -> bool:
+    """يتحقق من كلمة السر بمقارنة ثابتة الزمن."""
+    computed, _ = _hash_password(password, salt_hex)
+    return secrets.compare_digest(computed, hash_hex)
+
+
+def _find_company_by_email(email: str) -> tuple[str | None, dict | None]:
+    """يبحث عن حساب موجود بنفس الإيميل (لربط الدفع بحساب التجربة)."""
+    email_norm = email.strip().lower()
+    for api_key, company in DB_COMPANIES.items():
+        if company.get("email", "").strip().lower() == email_norm:
+            return api_key, company
+    return None, None
+
+
+def is_trial_expired(company: dict) -> bool:
+    """يرجع True إذا انتهت الفترة التجريبية ولم يدفع العميل بعد."""
+    if not company.get("trial") or company.get("payment_method"):
+        return False
+    ends_at = company.get("trial_ends_at")
+    if not ends_at:
+        return False
+    return datetime.now(timezone.utc) > datetime.fromisoformat(ends_at)
+
+
+def trial_status(company: dict) -> dict:
+    """يحسب الوقت المتبقي من التجربة لعرضه كعدّاد بالواجهة."""
+    if not company.get("trial") or company.get("payment_method"):
+        return {
+            "is_trial": False,
+            "trial_ends_at": None,
+            "seconds_remaining": 0,
+        }
+    ends_at = datetime.fromisoformat(company["trial_ends_at"])
+    remaining = (ends_at - datetime.now(timezone.utc)).total_seconds()
+    return {
+        "is_trial": True,
+        "trial_ends_at": company["trial_ends_at"],
+        "seconds_remaining": max(0, int(remaining)),
+    }
 
 
 def get_company(api_key: str | None) -> dict:
@@ -384,7 +437,7 @@ async def create_checkout_session(
 # 2) Webhook Stripe — التفعيل التلقائي بعد نجاح دفع البطاقة
 # ---------------------------------------------------------------------------
 async def _activate_from_session(obj: dict) -> None:
-    """ينشئ حساب الشركة ويرسل المفتاح (مرة واحدة لكل جلسة)."""
+    """يرقّي حساب التجربة الموجود أو ينشئ حسابًا جديدًا (مرة لكل جلسة)."""
     session_id = obj["id"]
     if any(
         c.get("stripe_session_id") == session_id
@@ -399,6 +452,24 @@ async def _activate_from_session(obj: dict) -> None:
         plan = "basic"
     email = metadata.get("email", "")
 
+    existing_key, existing = _find_company_by_email(email)
+    if existing:
+        existing.update(
+            plan=plan,
+            trial=False,
+            payment_method="stripe",
+            stripe_session_id=session_id,
+            stripe_customer_id=obj.get("customer"),
+            stripe_subscription_id=obj.get("subscription"),
+            active=True,
+        )
+        _save_db()
+        await run_in_threadpool(
+            send_api_key_email, email, existing["name"], plan, existing_key
+        )
+        print(f"✅ ترقية حساب (Stripe): {existing['name']} — {plan}")
+        return
+
     api_key = f"ent_key_{uuid.uuid4().hex}"
     DB_COMPANIES[api_key] = {
         "name": name,
@@ -407,6 +478,7 @@ async def _activate_from_session(obj: dict) -> None:
         "file_data": "",
         "usage": {},
         "created_at": datetime.now(timezone.utc).isoformat(),
+        "trial": False,
         "stripe_session_id": session_id,
         "stripe_customer_id": obj.get("customer"),
         "stripe_subscription_id": obj.get("subscription"),
@@ -507,7 +579,7 @@ async def upload_company_file(
 # ---------------------------------------------------------------------------
 @app.get("/enterprise/me")
 async def get_me(x_api_key: OptionalHeader = None):
-    """يرجع معلومات الحساب والاستخدام الحالي."""
+    """يرجع معلومات الحساب، الاستخدام، وحالة التجربة (للعدّاد)."""
     company = get_company(x_api_key)
     plan = PLANS.get(company["plan"], PLANS["basic"])
     used = company.get("usage", {}).get(current_month_key(), 0)
@@ -519,6 +591,8 @@ async def get_me(x_api_key: OptionalHeader = None):
         "monthly_query_limit": plan["monthly_query_limit"],
         "queries_used_this_month": used,
         "has_uploaded_file": bool(company.get("file_data")),
+        "trial_expired": is_trial_expired(company),
+        **trial_status(company),
     }
 
 
@@ -536,6 +610,15 @@ async def ask_ai_assistant(
         raise HTTPException(
             status_code=403,
             detail="تم إلغاء الاشتراك. يرجى تجديد الباقة للمتابعة.",
+        )
+
+    if is_trial_expired(company):
+        raise HTTPException(
+            status_code=402,
+            detail=(
+                f"انتهت فترتك التجريبية ({TRIAL_DAYS} أيام). "
+                "يرجى الاشتراك بأحد الباقات للاستمرار."
+            ),
         )
 
     enforce_plan_limits(company)
@@ -556,31 +639,90 @@ async def ask_ai_assistant(
 
 
 # ---------------------------------------------------------------------------
-# تسجيل تجريبي مجاني (الفترة التجريبية)
+# تسجيل حقيقي: إنشاء حساب (تجربة مجانية 7 أيام) + تسجيل دخول بكلمة سر فعلية
 # ---------------------------------------------------------------------------
-@app.post("/enterprise/register-trial")
-async def register_trial(
-    name: Annotated[str, Form()], email: Annotated[str, Form()]
-):
-    """ينشئ حسابًا تجريبيًا بالباقة الأساسية."""
+class SignupRequest(BaseModel):
+    """جسم طلب إنشاء حساب جديد."""
+
+    name: str
+    email: str
+    password: str
+
+
+class LoginRequest(BaseModel):
+    """جسم طلب تسجيل الدخول."""
+
+    email: str
+    password: str
+
+
+@app.post("/enterprise/signup")
+async def signup(payload: SignupRequest):
+    """ينشئ حسابًا حقيقيًا بكلمة سر، ويبدأ تجربة مجانية 7 أيام فورًا."""
+    if len(payload.password) < 6:
+        raise HTTPException(
+            status_code=400, detail="كلمة السر يجب أن تكون 6 أحرف على الأقل."
+        )
+    existing_key, _ = _find_company_by_email(payload.email)
+    if existing_key:
+        raise HTTPException(
+            status_code=409,
+            detail="هذا البريد مسجّل مسبقًا. استخدم تسجيل الدخول.",
+        )
+
+    password_hash, password_salt = _hash_password(payload.password)
+    trial_ends_at = (
+        datetime.now(timezone.utc) + timedelta(days=TRIAL_DAYS)
+    ).isoformat()
+
     api_key = f"trial_key_{uuid.uuid4().hex}"
     DB_COMPANIES[api_key] = {
-        "name": name,
-        "plan": "basic",
-        "email": email,
+        "name": payload.name,
+        "plan": "pro",  # أثناء التجربة: كل المزايا مفتوحة لإقناع العميل
+        "email": payload.email,
+        "password_hash": password_hash,
+        "password_salt": password_salt,
         "file_data": "",
         "usage": {},
         "created_at": datetime.now(timezone.utc).isoformat(),
         "active": True,
         "trial": True,
+        "trial_ends_at": trial_ends_at,
+        "payment_method": None,
     }
     _save_db()
-    await run_in_threadpool(send_api_key_email, email, name, "basic", api_key)
+    await run_in_threadpool(
+        send_api_key_email, payload.email, payload.name, "pro", api_key
+    )
     return {
         "status": "success",
-        "company": name,
-        "plan": "basic",
+        "company": payload.name,
         "api_key": api_key,
+        "trial_ends_at": trial_ends_at,
+        "trial_days": TRIAL_DAYS,
+    }
+
+
+@app.post("/enterprise/login")
+async def login(payload: LoginRequest):
+    """يتحقق من الإيميل وكلمة السر، ويرجع مفتاح الحساب."""
+    api_key, company = _find_company_by_email(payload.email)
+    wrong_credentials = HTTPException(
+        status_code=401, detail="البريد الإلكتروني أو كلمة السر غير صحيحة."
+    )
+    if not company or "password_hash" not in company:
+        raise wrong_credentials
+    if not _verify_password(
+        payload.password, company["password_salt"], company["password_hash"]
+    ):
+        raise wrong_credentials
+
+    return {
+        "status": "success",
+        "company": company["name"],
+        "plan": company["plan"],
+        "api_key": api_key,
+        **trial_status(company),
     }
 
 
@@ -650,7 +792,28 @@ def _match_plan_by_amount(amount: float) -> str | None:
 async def _activate_paypal_payment(
     payer_email: str, plan: str, reference: str
 ) -> str:
-    """ينشئ حساب الشركة فورًا، مطابقًا لطلب معلّق إن وُجد."""
+    """يرقّي حساب التجربة الموجود، أو ينشئ حسابًا جديدًا إذا لم يوجد."""
+    existing_key, existing = _find_company_by_email(payer_email)
+    if existing:
+        existing.update(
+            plan=plan,
+            trial=False,
+            payment_method="paypal",
+            paypal_reference=reference,
+            verified=True,
+            active=True,
+        )
+        _save_db()
+        await run_in_threadpool(
+            send_api_key_email,
+            payer_email,
+            existing["name"],
+            plan,
+            existing_key,
+        )
+        print(f"✅ ترقية حساب (PayPal): {existing['name']} — {plan}")
+        return existing_key
+
     matched_claim, matched_request_id = None, None
     for request_id, claim in PENDING_CLAIMS.items():
         if claim["email"].strip().lower() == payer_email.strip().lower():
@@ -671,6 +834,7 @@ async def _activate_paypal_payment(
         "file_data": "",
         "usage": {},
         "created_at": datetime.now(timezone.utc).isoformat(),
+        "trial": False,
         "active": True,
         "payment_method": "paypal",
         "paypal_reference": reference,
@@ -820,6 +984,33 @@ async def admin_revoke(api_key: str, x_admin_token: OptionalHeader = None):
         "status": "success",
         "message": f"تم إيقاف حساب {company['name']}.",
     }
+
+
+@app.post("/admin/activate/{api_key}")
+async def admin_activate(api_key: str, x_admin_token: OptionalHeader = None):
+    """إعادة تفعيل حساب موقوف."""
+    _check_admin(x_admin_token)
+    company = get_company(api_key)
+    company["active"] = True
+    _save_db()
+    return {
+        "status": "success",
+        "message": f"تم تفعيل حساب {company['name']} بنجاح.",
+    }
+
+
+@app.delete("/admin/company/{api_key}")
+async def admin_delete_company(api_key: str, x_admin_token: OptionalHeader = None):
+    """حذف شركة أو حساب بشكل نهائي من النظام."""
+    _check_admin(x_admin_token)
+    if api_key in DB_COMPANIES:
+        deleted_company = DB_COMPANIES.pop(api_key)
+        _save_db()
+        return {
+            "status": "success",
+            "message": f"تم حذف شركة {deleted_company.get('name')} نهائياً.",
+        }
+    raise HTTPException(status_code=404, detail="مفتاح الـ API غير موجود.")
 
 
 if __name__ == "__main__":
