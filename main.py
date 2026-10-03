@@ -26,9 +26,11 @@ from pathlib import Path
 from typing import Annotated
 
 import anthropic
+import jwt
 import requests
 import stripe
 import uvicorn
+from cryptography.x509 import load_pem_x509_certificate
 from dotenv import load_dotenv
 from fastapi import (
     FastAPI,
@@ -93,6 +95,8 @@ PAYPAL_API_BASE = os.environ.get(
 PLAN_PRICES_USD = {"basic": 29, "pro": 79, "enterprise": 199}
 TRIAL_DAYS = 7
 
+FIREBASE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID", "")
+
 PAYPAL_LINKS = {
     "basic": "https://www.paypal.com/ncp/payment/23V3WQK4NVTG4",
     "pro": "https://www.paypal.com/ncp/payment/Z59KCWS6MZAC6",
@@ -112,6 +116,11 @@ if not ANTHROPIC_API_KEY and not GEMINI_API_KEY:
     print("⚠️  لا يوجد مفتاح ذكاء اصطناعي — سيتم استخدام رد احتياطي.")
 if not (PAYPAL_CLIENT_ID and PAYPAL_SECRET and PAYPAL_WEBHOOK_ID):
     print("⚠️  إعدادات PayPal (Client ID / Secret / Webhook ID) غير مكتملة.")
+if not FIREBASE_PROJECT_ID:
+    print(
+        "⚠️  FIREBASE_PROJECT_ID غير مُعرّف — "
+        "تسجيل الدخول بـ Google لن يعمل."
+    )
 
 # ---------------------------------------------------------------------------
 # الباقات (غيّر price_id لقيمك الحقيقية من لوحة Stripe)
@@ -233,6 +242,64 @@ def trial_status(company: dict) -> dict:
         "trial_ends_at": company["trial_ends_at"],
         "seconds_remaining": max(0, int(remaining)),
     }
+
+
+_firebase_keys_cache: dict = {"keys": {}, "expires_at": 0}
+
+
+def _get_firebase_public_keys() -> dict:
+    """يجلب شهادات Google العامة للتحقق من توقيع رموز Firebase، ويخزنها."""
+    now = time.time()
+    cached = _firebase_keys_cache
+    if cached["keys"] and cached["expires_at"] > now:
+        return cached["keys"]
+
+    resp = requests.get(
+        "https://www.googleapis.com/robot/v1/metadata/x509/"
+        "securetoken@system.gserviceaccount.com",
+        timeout=10,
+    )
+    resp.raise_for_status()
+    keys = {
+        kid: load_pem_x509_certificate(pem.encode()).public_key()
+        for kid, pem in resp.json().items()
+    }
+    _firebase_keys_cache["keys"] = keys
+    _firebase_keys_cache["expires_at"] = now + 3600
+    return keys
+
+
+def _verify_firebase_id_token(id_token: str) -> dict:
+    """يتحقق من توقيع رمز Google ID Token مباشرة (لا يمكن تزويره)."""
+    invalid = HTTPException(
+        status_code=401, detail="رمز تسجيل الدخول عبر Google غير صالح."
+    )
+    try:
+        header = jwt.get_unverified_header(id_token)
+    except jwt.PyJWTError as exc:
+        raise invalid from exc
+
+    public_key = _get_firebase_public_keys().get(header.get("kid"))
+    if not public_key:
+        raise invalid
+
+    try:
+        payload = jwt.decode(
+            id_token,
+            public_key,
+            algorithms=["RS256"],
+            audience=FIREBASE_PROJECT_ID,
+            issuer=f"https://securetoken.google.com/{FIREBASE_PROJECT_ID}",
+        )
+    except jwt.PyJWTError as exc:
+        raise invalid from exc
+
+    if not payload.get("email_verified") or not payload.get("email"):
+        raise HTTPException(
+            status_code=401,
+            detail="يجب تأكيد البريد الإلكتروني عبر Google أولاً.",
+        )
+    return payload
 
 
 def get_company(api_key: str | None) -> dict:
@@ -710,7 +777,15 @@ async def login(payload: LoginRequest):
     wrong_credentials = HTTPException(
         status_code=401, detail="البريد الإلكتروني أو كلمة السر غير صحيحة."
     )
-    if not company or "password_hash" not in company:
+    if not company or not company.get("password_hash"):
+        if company and company.get("oauth_provider"):
+            raise HTTPException(
+                status_code=401,
+                detail=(
+                    "هذا الحساب مسجّل عبر Google. "
+                    "استخدم زر المتابعة عبر Google."
+                ),
+            )
         raise wrong_credentials
     if not _verify_password(
         payload.password, company["password_salt"], company["password_hash"]
@@ -723,6 +798,68 @@ async def login(payload: LoginRequest):
         "plan": company["plan"],
         "api_key": api_key,
         **trial_status(company),
+    }
+
+
+class OAuthLoginRequest(BaseModel):
+    """جسم طلب تسجيل الدخول عبر Google."""
+
+    id_token: str
+
+
+@app.post("/enterprise/oauth-login")
+async def oauth_login(payload: OAuthLoginRequest):
+    """يتحقق من رمز Google الحقيقي، ويسجل الدخول أو ينشئ تجربة جديدة."""
+    if not FIREBASE_PROJECT_ID:
+        raise HTTPException(
+            status_code=500, detail="تسجيل الدخول عبر Google غير مُفعّل."
+        )
+
+    claims = await run_in_threadpool(
+        _verify_firebase_id_token, payload.id_token
+    )
+    email = claims["email"]
+    name = claims.get("name") or email.split("@")[0]
+
+    api_key, company = _find_company_by_email(email)
+    if company:
+        return {
+            "status": "success",
+            "company": company["name"],
+            "plan": company["plan"],
+            "api_key": api_key,
+            **trial_status(company),
+        }
+
+    trial_ends_at = (
+        datetime.now(timezone.utc) + timedelta(days=TRIAL_DAYS)
+    ).isoformat()
+    new_key = f"trial_key_{uuid.uuid4().hex}"
+    DB_COMPANIES[new_key] = {
+        "name": name,
+        "plan": "pro",
+        "email": email,
+        "password_hash": None,
+        "password_salt": None,
+        "oauth_provider": "google",
+        "file_data": "",
+        "usage": {},
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "active": True,
+        "trial": True,
+        "trial_ends_at": trial_ends_at,
+        "payment_method": None,
+    }
+    _save_db()
+    await run_in_threadpool(send_api_key_email, email, name, "pro", new_key)
+    return {
+        "status": "success",
+        "company": name,
+        "plan": "pro",
+        "api_key": new_key,
+        "is_trial": True,
+        "trial_ends_at": trial_ends_at,
+        "seconds_remaining": TRIAL_DAYS * 86400,
     }
 
 
@@ -984,106 +1121,6 @@ async def admin_revoke(api_key: str, x_admin_token: OptionalHeader = None):
         "status": "success",
         "message": f"تم إيقاف حساب {company['name']}.",
     }
-
-
-@app.post("/admin/activate/{api_key}")
-async def admin_activate(api_key: str, x_admin_token: OptionalHeader = None):
-    """إعادة تفعيل حساب موقوف."""
-    _check_admin(x_admin_token)
-    company = get_company(api_key)
-    company["active"] = True
-    _save_db()
-    return {
-        "status": "success",
-        "message": f"تم تفعيل حساب {company['name']} بنجاح.",
-    }
-
-
-@app.delete("/admin/company/{api_key}")
-async def admin_delete_company(api_key: str, x_admin_token: OptionalHeader = None):
-    """حذف شركة أو حساب بشكل نهائي من النظام."""
-    _check_admin(x_admin_token)
-    if api_key in DB_COMPANIES:
-        deleted_company = DB_COMPANIES.pop(api_key)
-        _save_db()
-        return {
-            "status": "success",
-            "message": f"تم حذف شركة {deleted_company.get('name')} نهائياً.",
-        }
-    raise HTTPException(status_code=404, detail="مفتاح الـ API غير موجود.")
-
-
-class OAuthLoginRequest(BaseModel):
-    """نموذج طلب تسجيل الدخول عبر Google OAuth."""
-    id_token: str
-
-
-@app.post("/enterprise/oauth-login")
-def oauth_login(payload: OAuthLoginRequest):
-    """يتحقق من توكن Google ويسجل الدخول أو ينشئ حساب تجريبي جديد تلقائياً."""
-    try:
-        resp = requests.get(
-            f"https://oauth2.googleapis.com/tokeninfo?id_token={payload.id_token}",
-            timeout=10
-        )
-        if resp.status_code != 200:
-            raise HTTPException(
-                status_code=401,
-                detail="توكن Google غير صالح أو منتهي الصلاحية."
-            )
-
-        user_info = resp.json()
-        email = user_info.get("email")
-        name = user_info.get("name", email.split("@")[0] if email else "مستخدم Google")
-
-        if not email:
-            raise HTTPException(
-                status_code=400,
-                detail="البريد الإلكتروني غير متوفر من حساب Google."
-            )
-
-        existing_key, existing_company = _find_company_by_email(email)
-        if existing_company:
-            return {
-                "status": "success",
-                "message": "تم تسجيل الدخول بنجاح.",
-                "company": existing_company["name"],
-                "plan": existing_company["plan"],
-                "api_key": existing_key,
-                **trial_status(existing_company)
-            }
-
-        trial_ends_at = (
-            datetime.now(timezone.utc) + timedelta(days=TRIAL_DAYS)
-        ).isoformat()
-        api_key = f"google_key_{uuid.uuid4().hex}"
-
-        DB_COMPANIES[api_key] = {
-            "name": name,
-            "plan": "pro",
-            "email": email,
-            "file_data": "",
-            "usage": {},
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "active": True,
-            "trial": True,
-            "trial_ends_at": trial_ends_at,
-            "payment_method": None,
-        }
-        _save_db()
-
-        return {
-            "status": "success",
-            "message": "تم إنشاء الحساب وتسجيل الدخول بنجاح.",
-            "company": name,
-            "api_key": api_key,
-            "trial_ends_at": trial_ends_at
-        }
-    except Exception as exc:
-        raise HTTPException(
-            status_code=401,
-            detail="فشل المصادقة عبر Google."
-        ) from exc
 
 
 if __name__ == "__main__":
