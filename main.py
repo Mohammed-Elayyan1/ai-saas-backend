@@ -27,6 +27,8 @@ from typing import Annotated
 
 import anthropic
 import jwt
+import psycopg2
+import psycopg2.extras
 import requests
 import stripe
 import uvicorn
@@ -80,6 +82,9 @@ SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER = os.environ.get("SMTP_USER", "")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
 SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USER)
+# بريد المالك/الأدمن — يستقبل تنبيهات فورية عند فشل أي عملية تفعيل دفع
+# (مثلاً انقطاع الإنترنت لحظة الدفع)، حتى ما تضيع فلوس عميل بصمت.
+ADMIN_ALERT_EMAIL = os.environ.get("ADMIN_ALERT_EMAIL", SMTP_FROM)
 
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024  # 2MB
@@ -98,6 +103,11 @@ PAID_PERIOD_DAYS = 30
 RESET_TOKEN_TTL_MINUTES = 30
 
 FIREBASE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID", "")
+
+# قاعدة بيانات PostgreSQL حقيقية (Railway يضيف DATABASE_URL أوتوماتيكيًا
+# بعد ربط Add-on من نوع Postgres). بدونها نرجع لملفات JSON محليًا فقط
+# (تُفقد عند كل Redeploy — غير مناسبة لعملاء حقيقيين).
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 PAYPAL_LINKS = {
     "basic": "https://www.paypal.com/ncp/payment/23V3WQK4NVTG4",
@@ -122,6 +132,12 @@ if not FIREBASE_PROJECT_ID:
     print(
         "⚠️  FIREBASE_PROJECT_ID غير مُعرّف — "
         "تسجيل الدخول بـ Google لن يعمل."
+    )
+if not DATABASE_URL:
+    print(
+        "⚠️  DATABASE_URL غير مُعرّف — سيتم استخدام ملفات JSON محلية، "
+        "وستُفقد كل الحسابات عند أي Redeploy. اربط Add-on من نوع "
+        "PostgreSQL على Railway قبل استقبال أي عميل حقيقي."
     )
 
 # ---------------------------------------------------------------------------
@@ -152,7 +168,8 @@ PLANS: dict[str, dict] = {
 }
 
 # ---------------------------------------------------------------------------
-# التخزين (ملفات JSON) — الخطوة التالية الحقيقية هي PostgreSQL
+# التخزين: PostgreSQL حقيقي إذا تم ربط DATABASE_URL، وإلا ملفات JSON
+# محلية (احتياطي للتطوير فقط — تُفقد عند كل Redeploy).
 # ---------------------------------------------------------------------------
 DB_FILE = Path(__file__).parent / "companies_db.json"
 PENDING_FILE = Path(__file__).parent / "pending_claims.json"
@@ -176,18 +193,92 @@ def _save_json(path: Path, data: dict) -> None:
     )
 
 
+def _get_pg_connection():
+    """يفتح اتصالًا جديدًا بقاعدة بيانات Railway Postgres.
+
+    sslmode="prefer" (بدل "require") لأن اتصال الشبكة الداخلية على
+    Railway غالبًا لا يحتاج SSL، وتثبيت "require" قد يفشل الاتصال.
+    """
+    sslmode = os.environ.get("PGSSLMODE", "prefer")
+    return psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+
+
+def _init_pg_schema() -> None:
+    """ينشئ الجدولين إذا لم يكونا موجودين (يعمل مرة واحدة عند الإقلاع)."""
+    if not DATABASE_URL:
+        return
+    with _get_pg_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS companies (
+                api_key TEXT PRIMARY KEY,
+                data JSONB NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_claims (
+                request_id TEXT PRIMARY KEY,
+                data JSONB NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+def _load_companies() -> dict:
+    """يحمّل كل حسابات الشركات من Postgres، أو من ملف JSON احتياطيًا."""
+    if not DATABASE_URL:
+        return _load_json(DB_FILE)
+    with _get_pg_connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT api_key, data FROM companies")
+        return {row[0]: row[1] for row in cur.fetchall()}
+
+
+def _load_pending() -> dict:
+    """يحمّل طلبات PayPal المعلّقة من Postgres، أو من JSON احتياطيًا."""
+    if not DATABASE_URL:
+        return _load_json(PENDING_FILE)
+    with _get_pg_connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT request_id, data FROM pending_claims")
+        return {row[0]: row[1] for row in cur.fetchall()}
+
+
 def _save_db() -> None:
-    """يحفظ بيانات الشركات."""
-    _save_json(DB_FILE, DB_COMPANIES)
+    """يحفظ بيانات الشركات (Postgres إن توفر، وإلا ملف JSON)."""
+    if not DATABASE_URL:
+        _save_json(DB_FILE, DB_COMPANIES)
+        return
+    with _get_pg_connection() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM companies")
+        for api_key, data in DB_COMPANIES.items():
+            cur.execute(
+                "INSERT INTO companies (api_key, data) VALUES (%s, %s)",
+                (api_key, psycopg2.extras.Json(data)),
+            )
+        conn.commit()
 
 
 def _save_pending() -> None:
-    """يحفظ طلبات PayPal المعلّقة (نية الدفع قبل تأكيد PayPal)."""
-    _save_json(PENDING_FILE, PENDING_CLAIMS)
+    """يحفظ طلبات PayPal المعلّقة (Postgres إن توفر، وإلا ملف JSON)."""
+    if not DATABASE_URL:
+        _save_json(PENDING_FILE, PENDING_CLAIMS)
+        return
+    with _get_pg_connection() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM pending_claims")
+        for request_id, data in PENDING_CLAIMS.items():
+            cur.execute(
+                "INSERT INTO pending_claims (request_id, data) "
+                "VALUES (%s, %s)",
+                (request_id, psycopg2.extras.Json(data)),
+            )
+        conn.commit()
 
 
-DB_COMPANIES: dict = _load_json(DB_FILE)  # api_key -> company record
-PENDING_CLAIMS: dict = _load_json(PENDING_FILE)  # request_id -> claim
+_init_pg_schema()
+DB_COMPANIES: dict = _load_companies()  # api_key -> company record
+PENDING_CLAIMS: dict = _load_pending()  # request_id -> claim
 
 
 def current_month_key() -> str:
@@ -414,6 +505,26 @@ def send_password_reset_email(
             server.sendmail(SMTP_FROM, [to_email], msg.as_string())
     except OSError as exc:
         print(f"⚠️  فشل إرسال بريد إعادة التعيين: {exc}")
+
+
+def send_admin_alert(subject: str, body: str) -> None:
+    """ينبّه الأدمن فورًا عند فشل تفعيل دفعة (شبكة/قاعدة بيانات)، حتى لا
+    تضيع فلوس عميل بصمت. يطبع بالسجلات دائمًا، ويرسل بريدًا أيضًا إذا
+    كانت إعدادات SMTP موجودة."""
+    print(f"🚨 تنبيه أدمن: {subject}\n{body}")
+    if not (SMTP_HOST and SMTP_USER and SMTP_PASSWORD and ADMIN_ALERT_EMAIL):
+        return
+    msg = MIMEText(body, _charset="utf-8")
+    msg["Subject"] = f"🚨 تنبيه NexusAI: {subject}"
+    msg["From"] = SMTP_FROM
+    msg["To"] = ADMIN_ALERT_EMAIL
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(SMTP_FROM, [ADMIN_ALERT_EMAIL], msg.as_string())
+    except OSError as exc:
+        print(f"⚠️  فشل إرسال بريد تنبيه الأدمن: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -1155,6 +1266,19 @@ async def paypal_webhook(request: Request):
             _verify_paypal_webhook, headers, body
         )
     except requests.RequestException as exc:
+        # غالبًا انقطاع إنترنت/شبكة لحظة الدفع. PayPal يعيد المحاولة
+        # تلقائيًا لاحقًا، لكن ننبّه الأدمن فورًا كشبكة أمان إضافية.
+        await run_in_threadpool(
+            send_admin_alert,
+            "فشل الاتصال بـ PayPal أثناء التحقق من دفعة",
+            (
+                f"تعذر الوصول لسيرفرات PayPal للتحقق من إشعار دفع "
+                f"(خطأ: {exc}).\n"
+                "PayPal سيعيد إرسال الإشعار تلقائيًا، لكن إذا لم يصلك "
+                "بريد تفعيل للعميل خلال ساعات، راجع لوحة PayPal يدويًا "
+                "وفعّل الحساب عبر /admin/companies إذا لزم."
+            ),
+        )
         print(f"⚠️  فشل الاتصال بـ PayPal للتحقق: {exc}")
         raise HTTPException(
             status_code=502, detail="تعذر التحقق من الإشعار."
@@ -1186,7 +1310,31 @@ async def paypal_webhook(request: Request):
     if already:
         return {"status": "already_processed"}
 
-    await _activate_paypal_payment(payer_email, plan, reference)
+    try:
+        await _activate_paypal_payment(payer_email, plan, reference)
+    except (psycopg2.Error, OSError, KeyError) as exc:
+        # دفعة حقيقية استُلمت ووُثّق تحققها من PayPal، لكن التفعيل نفسه
+        # فشل (مثلاً قاعدة البيانات مش متاحة لحظة الدفع). ما نخسر العميل:
+        # ننبّه الأدمن فورًا بكل التفاصيل اللازمة للتفعيل اليدوي، ونرجع
+        # 500 حتى تعيد PayPal إرسال الإشعار تلقائيًا من جهتها كذلك.
+        await run_in_threadpool(
+            send_admin_alert,
+            "دفعة PayPal حقيقية وصلت ولكن التفعيل فشل!",
+            (
+                "⚠️ عميل دفع فعليًا وتحقق PayPal من الدفعة بنجاح، لكن "
+                f"تفعيل الحساب فشل تقنيًا (خطأ: {exc}).\n\n"
+                f"البريد: {payer_email}\n"
+                f"الباقة: {plan}\n"
+                f"مبلغ الدفعة: {amount}\n"
+                f"مرجع PayPal: {reference}\n\n"
+                "فعّل الحساب يدويًا بأسرع وقت حتى لا يخسر العميل مفتاحه، "
+                "أو انتظر — PayPal سيعيد إرسال الإشعار تلقائيًا."
+            ),
+        )
+        raise HTTPException(
+            status_code=500, detail="فشل تفعيل الحساب، سيُعاد المحاولة."
+        ) from exc
+
     return {"status": "activated"}
 
 
