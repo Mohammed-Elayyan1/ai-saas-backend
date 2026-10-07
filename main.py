@@ -75,11 +75,26 @@ else:
 
 app = FastAPI(title="Enterprise AI SaaS Backend", version="4.0")
 
+
+def _real_client_ip(request: Request) -> str:
+    """يرجع عنوان IP الحقيقي للزائر، وليس عنوان الوسيط الداخلي لـ Railway.
+
+    Railway (وأي منصة استضافة خلف reverse proxy) توصل الطلبات عبر طبقة
+    وسيطة، فعنوان الاتصال المباشر (request.client.host) يتغيّر بكل طلب
+    ولا يمثّل جهاز الزائر الفعلي. العنوان الحقيقي موجود برأس
+    X-Forwarded-For الذي تضيفه هذه الطبقة تلقائيًا.
+    """
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    return get_remote_address(request)
+
+
 # ---------------------------------------------------------------------------
 # حدّ لعدد المحاولات لكل IP — يمنع هجمات تخمين كلمات السر وإغراق السيرفر
 # بحسابات تجريبية وهمية. يعمل بالذاكرة مباشرة، بدون أي خدمة خارجية أو تكلفة.
 # ---------------------------------------------------------------------------
-limiter = Limiter(key_func=get_remote_address)
+limiter = Limiter(key_func=_real_client_ip)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
