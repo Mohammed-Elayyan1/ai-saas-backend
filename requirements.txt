@@ -7,3 +7,5 @@ python-multipart
 python-dotenv
 pyjwt[crypto]
 psycopg2-binary
+slowapi
+sentry-sdk[fastapi]

@@ -11,6 +11,7 @@
     PAYPAL_SECRET=...
     PAYPAL_WEBHOOK_ID=...
     ADMIN_TOKEN=...
+    SENTRY_DSN=... (اختياري — مراقبة أخطاء مجانية عبر sentry.io)
 """
 
 import hashlib
@@ -30,6 +31,7 @@ import jwt
 import psycopg2
 import psycopg2.extras
 import requests
+import sentry_sdk
 import stripe
 import uvicorn
 from cryptography.x509 import load_pem_x509_certificate
@@ -46,10 +48,40 @@ from fastapi import (
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 load_dotenv()
 
+# ---------------------------------------------------------------------------
+# مراقبة الأخطاء (Sentry) — مجانية حتى 5000 خطأ/شهر، بدون بطاقة ائتمان.
+# إذا SENTRY_DSN غير معرّف، يعمل الموقع بشكل طبيعي بدون أي مراقبة (اختياري تمامًا).
+# ---------------------------------------------------------------------------
+SENTRY_DSN = os.environ.get("SENTRY_DSN", "")
+if SENTRY_DSN:
+    sentry_sdk.init(
+        dsn=SENTRY_DSN,
+        environment=os.environ.get("SENTRY_ENVIRONMENT", "production"),
+        traces_sample_rate=0.2,
+        send_default_pii=False,
+    )
+    print("✅ Sentry مفعّل — الأخطاء غير المتوقعة سترسل تنبيهًا تلقائيًا.")
+else:
+    print(
+        "⚠️  SENTRY_DSN غير مُعرّف — لا توجد مراقبة أخطاء تلقائية. "
+        "راجع تعليمات الإعداد بأعلى هذا الملف."
+    )
+
 app = FastAPI(title="Enterprise AI SaaS Backend", version="4.0")
+
+# ---------------------------------------------------------------------------
+# حدّ لعدد المحاولات لكل IP — يمنع هجمات تخمين كلمات السر وإغراق السيرفر
+# بحسابات تجريبية وهمية. يعمل بالذاكرة مباشرة، بدون أي خدمة خارجية أو تكلفة.
+# ---------------------------------------------------------------------------
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
@@ -510,8 +542,11 @@ def send_password_reset_email(
 def send_admin_alert(subject: str, body: str) -> None:
     """ينبّه الأدمن فورًا عند فشل تفعيل دفعة (شبكة/قاعدة بيانات)، حتى لا
     تضيع فلوس عميل بصمت. يطبع بالسجلات دائمًا، ويرسل بريدًا أيضًا إذا
-    كانت إعدادات SMTP موجودة."""
+    كانت إعدادات SMTP موجودة. يسجَّل أيضًا في Sentry (إذا كان مفعّلًا) ليظهر
+    مع باقي الأخطاء بنفس اللوحة."""
     print(f"🚨 تنبيه أدمن: {subject}\n{body}")
+    if SENTRY_DSN:
+        sentry_sdk.capture_message(f"🚨 {subject}\n{body}", level="error")
     if not (SMTP_HOST and SMTP_USER and SMTP_PASSWORD and ADMIN_ALERT_EMAIL):
         return
     msg = MIMEText(body, _charset="utf-8")
@@ -831,8 +866,9 @@ async def get_me(x_api_key: OptionalHeader = None):
 # 6) نقطة الأسئلة
 # ---------------------------------------------------------------------------
 @app.post("/enterprise/ask")
+@limiter.limit("20/minute")
 async def ask_ai_assistant(
-    payload: QuestionRequest, x_api_key: OptionalHeader = None
+    request: Request, payload: QuestionRequest, x_api_key: OptionalHeader = None
 ):
     """يجيب على سؤال العميل مع تطبيق حدود الباقة."""
     company = get_company(x_api_key)
@@ -888,7 +924,8 @@ class LoginRequest(BaseModel):
 
 
 @app.post("/enterprise/signup")
-async def signup(payload: SignupRequest):
+@limiter.limit("5/hour")
+async def signup(request: Request, payload: SignupRequest):
     """ينشئ حسابًا حقيقيًا بكلمة سر، ويبدأ تجربة مجانية 7 أيام فورًا."""
     if len(payload.password) < 6:
         raise HTTPException(
@@ -935,7 +972,8 @@ async def signup(payload: SignupRequest):
 
 
 @app.post("/enterprise/login")
-async def login(payload: LoginRequest):
+@limiter.limit("10/minute")
+async def login(request: Request, payload: LoginRequest):
     """يتحقق من الإيميل وكلمة السر، ويرجع مفتاح الحساب."""
     api_key, company = _find_company_by_email(payload.email)
     wrong_credentials = HTTPException(
@@ -973,7 +1011,8 @@ class OAuthLoginRequest(BaseModel):
 
 
 @app.post("/enterprise/oauth-login")
-async def oauth_login(payload: OAuthLoginRequest):
+@limiter.limit("10/minute")
+async def oauth_login(request: Request, payload: OAuthLoginRequest):
     """يتحقق من رمز Google الحقيقي، ويسجل الدخول أو ينشئ تجربة جديدة."""
     if not FIREBASE_PROJECT_ID:
         raise HTTPException(
@@ -1055,7 +1094,8 @@ _GENERIC_RESET_RESPONSE = {
 
 
 @app.post("/enterprise/forgot-password")
-async def forgot_password(payload: ForgotPasswordRequest):
+@limiter.limit("5/hour")
+async def forgot_password(request: Request, payload: ForgotPasswordRequest):
     """يرسل رمز إعادة تعيين حقيقي، بدون الكشف عن وجود البريد أو عدمه."""
     _, company = _find_company_by_email(payload.email)
     if not company or not company.get("password_hash"):
@@ -1077,7 +1117,8 @@ async def forgot_password(payload: ForgotPasswordRequest):
 
 
 @app.post("/enterprise/reset-password")
-async def reset_password(payload: ResetPasswordRequest):
+@limiter.limit("10/hour")
+async def reset_password(request: Request, payload: ResetPasswordRequest):
     """يستبدل كلمة السر بعد التحقق من رمز حقيقي غير منتهٍ."""
     if len(payload.new_password) < 6:
         raise HTTPException(
