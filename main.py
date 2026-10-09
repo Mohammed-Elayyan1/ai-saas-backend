@@ -637,7 +637,7 @@ def _build_system_prompt(company_name: str, files: list[dict]) -> str:
 def _call_gemini(question: str, system_prompt: str) -> str:
     resp = requests.post(
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        "gemini-2.5-flash:generateContent",
+        "gemini-3.8-flash:generateContent",
         params={"key": GEMINI_API_KEY},
         json={
             "system_instruction": {"parts": [{"text": system_prompt}]},
