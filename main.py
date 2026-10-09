@@ -638,13 +638,16 @@ def _call_gemini(question: str, system_prompt: str) -> str:
     resp = requests.post(
         "https://generativelanguage.googleapis.com/v1beta/models/"
         "gemini-2.5-flash:generateContent",
-        headers={"x-goog-api-key": GEMINI_API_KEY},
+        params={"key": GEMINI_API_KEY},
         json={
             "system_instruction": {"parts": [{"text": system_prompt}]},
             "contents": [{"role": "user", "parts": [{"text": question}]}],
         },
         timeout=30,
     )
+    if not resp.ok:
+        # نطبع نص الخطأ الكامل من Google بدل الاكتفاء برمز الحالة، ليسهل تشخيص السبب الحقيقي.
+        print(f"⚠️  Gemini API رفض الطلب ({resp.status_code}): {resp.text}")
     resp.raise_for_status()
     data = resp.json()
     return data["candidates"][0]["content"]["parts"][0]["text"]
