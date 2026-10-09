@@ -45,6 +45,7 @@ from fastapi import (
     Request,
     UploadFile,
 )
+from fastapi import Response as FastAPIResponse
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -113,6 +114,21 @@ OptionalHeader = Annotated[str | None, Header()]
 async def health_check():
     """نقطة فحص بسيطة للتأكد أن الخادم شغال."""
     return {"status": "ok", "service": "Enterprise AI SaaS Backend"}
+
+
+_WIDGET_JS_PATH = Path(__file__).parent / "widget.js"
+
+
+@app.get("/widget.js")
+async def serve_widget_js():
+    """يخدّم ويدجت المحادثة القابل للتضمين مباشرة من نفس السيرفر، حتى
+    تقدر الشركات تضيفه بسطر واحد بمواقعها بدون أي استضافة إضافية."""
+    if not _WIDGET_JS_PATH.exists():
+        raise HTTPException(status_code=404, detail="widget.js غير موجود.")
+    return FastAPIResponse(
+        content=_WIDGET_JS_PATH.read_text(encoding="utf-8"),
+        media_type="application/javascript; charset=utf-8",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -580,7 +596,24 @@ def send_admin_alert(subject: str, body: str) -> None:
 # ---------------------------------------------------------------------------
 # طبقة الذكاء الاصطناعي (Gemini أو Claude)
 # ---------------------------------------------------------------------------
-def _build_system_prompt(company_name: str, file_data: str) -> str:
+def _company_files(company: dict) -> list[dict]:
+    """يرجع قائمة ملفات الشركة، مع التوافق مع الحسابات القديمة التي
+    كانت تخزّن ملفًا واحدًا فقط بحقل file_data."""
+    files = company.get("files")
+    if files:
+        return files
+    legacy = company.get("file_data")
+    if legacy:
+        return [{"name": "ملف مرفوع", "content": legacy}]
+    return []
+
+
+# الحد الأقصى الإجمالي لعدد الأحرف من كل ملفات الشركة التي تُرسل للذكاء
+# الاصطناعي بكل سؤال — لضبط تكلفة وسرعة الاستجابة بغض النظر عن عدد الملفات.
+MAX_TOTAL_FILE_CHARS = 12000
+
+
+def _build_system_prompt(company_name: str, files: list[dict]) -> str:
     prompt = (
         f'أنت مساعد ذكاء اصطناعي خاص بشركة "{company_name}". '
         "أجب على أسئلة العملاء بالاعتماد فقط على المعلومات المتوفرة "
@@ -588,8 +621,16 @@ def _build_system_prompt(company_name: str, file_data: str) -> str:
         "مهذبة توضح أنك بحاجة لمزيد من البيانات. "
         "أجب بنفس لغة سؤال المستخدم (عربي أو إنجليزي)."
     )
-    if file_data:
-        prompt += f"\n\nبيانات الشركة المرفوعة:\n{file_data[:6000]}"
+    if files:
+        remaining = MAX_TOTAL_FILE_CHARS
+        chunks = []
+        for f in files:
+            if remaining <= 0:
+                break
+            content = f.get("content", "")[:remaining]
+            remaining -= len(content)
+            chunks.append(f"[ملف: {f.get('name', 'بدون اسم')}]\n{content}")
+        prompt += "\n\nبيانات الشركة المرفوعة:\n" + "\n\n".join(chunks)
     return prompt
 
 
@@ -621,21 +662,21 @@ def _call_anthropic(question: str, system_prompt: str) -> str:
 
 
 def generate_ai_answer(
-    question: str, company_name: str, file_data: str
+    question: str, company_name: str, files: list[dict]
 ) -> str:
     """يولّد رد الذكاء الاصطناعي أو رد احتياطي إن لم يوجد مفتاح."""
     if not GEMINI_API_KEY and not ANTHROPIC_API_KEY:
         base = f'شكرًا لسؤالكم: "{question}". '
-        if file_data:
+        if files:
             base += (
-                "بناءً على المستند المرفوع، يمكنني مساعدتكم بمزيد من "
+                "بناءً على المستندات المرفوعة، يمكنني مساعدتكم بمزيد من "
                 "التفاصيل بمجرد تفعيل الذكاء الاصطناعي الحقيقي."
             )
         else:
             base += "لم يتم رفع أي مستندات بعد لهذه الشركة."
         return base
 
-    system_prompt = _build_system_prompt(company_name, file_data)
+    system_prompt = _build_system_prompt(company_name, files)
     try:
         if GEMINI_API_KEY:
             return _call_gemini(question, system_prompt)
@@ -838,7 +879,7 @@ async def upload_company_file(
     file: Annotated[UploadFile, File()],
     x_api_key: OptionalHeader = None,
 ):
-    """يرفع ملف نصي ويربطه بحساب الشركة."""
+    """يرفع ملف نصي ويضيفه لملفات حساب الشركة، ضمن حد باقتها."""
     company = get_company(x_api_key)
     content_bytes = await file.read()
     if len(content_bytes) > MAX_UPLOAD_BYTES:
@@ -846,12 +887,68 @@ async def upload_company_file(
             status_code=413,
             detail="الملف كبير جدًا (الحد الأقصى 2MB).",
         )
-    company["file_data"] = content_bytes.decode("utf-8", errors="ignore")
+
+    plan = PLANS.get(company["plan"], PLANS["basic"])
+    max_files = plan["max_files"]
+    files = _company_files(company)
+    if max_files is not None and len(files) >= max_files:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"وصلت للحد الأقصى ({max_files} ملف) لباقتكم. "
+                "احذف ملفًا قديمًا أو رقّوا باقتكم لرفع المزيد."
+            ),
+        )
+
+    files.append(
+        {
+            "name": file.filename or "ملف بدون اسم",
+            "content": content_bytes.decode("utf-8", errors="ignore"),
+            "uploaded_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    company["files"] = files
+    company["file_data"] = ""  # الحقل القديم لم يعد يُستخدم كمصدر للبيانات
     _save_db()
     return {
         "status": "success",
-        "message": "تم رفع الملف وربطه بحساب شركتكم بنجاح.",
+        "message": "تم رفع الملف وإضافته لملفات شركتكم بنجاح.",
+        "files": [f["name"] for f in files],
+        "files_count": len(files),
+        "max_files": max_files,
     }
+
+
+@app.get("/enterprise/files")
+async def list_company_files(x_api_key: OptionalHeader = None):
+    """يرجع قائمة الملفات المرفوعة لحساب الشركة وحد باقتها."""
+    company = get_company(x_api_key)
+    plan = PLANS.get(company["plan"], PLANS["basic"])
+    files = _company_files(company)
+    return {
+        "files": [
+            {"name": f["name"], "uploaded_at": f.get("uploaded_at")}
+            for f in files
+        ],
+        "files_count": len(files),
+        "max_files": plan["max_files"],
+    }
+
+
+@app.delete("/enterprise/files/{file_name}")
+async def delete_company_file(
+    file_name: str, x_api_key: OptionalHeader = None
+):
+    """يحذف ملفًا واحدًا بالاسم من حساب الشركة، لتحرير مكان ضمن الحد."""
+    company = get_company(x_api_key)
+    files = _company_files(company)
+    remaining = [f for f in files if f["name"] != file_name]
+    if len(remaining) == len(files):
+        raise HTTPException(status_code=404, detail="الملف غير موجود.")
+    company["files"] = remaining
+    company["file_data"] = ""
+    _save_db()
+    return {"status": "success", "files_count": len(remaining)}
 
 
 # ---------------------------------------------------------------------------
@@ -870,7 +967,9 @@ async def get_me(x_api_key: OptionalHeader = None):
         "active": company.get("active", True),
         "monthly_query_limit": plan["monthly_query_limit"],
         "queries_used_this_month": used,
-        "has_uploaded_file": bool(company.get("file_data")),
+        "has_uploaded_file": bool(_company_files(company)),
+        "files_count": len(_company_files(company)),
+        "max_files": plan["max_files"],
         "trial_expired": is_trial_expired(company),
         **trial_status(company),
         **paid_status(company),
@@ -909,7 +1008,7 @@ async def ask_ai_assistant(
         generate_ai_answer,
         payload.question,
         company["name"],
-        company.get("file_data", ""),
+        _company_files(company),
     )
     record_usage(company)
 
