@@ -1798,6 +1798,13 @@ async def admin_paypal_health(x_admin_token: OptionalHeader = None):
             "message": "PAYPAL_CLIENT_ID أو PAYPAL_SECRET غير معرّفين على Railway.",
         }
 
+    def _mask(value: str) -> str:
+        """يعرض أول وآخر 4 أحرف فقط + الطول، دون كشف القيمة الكاملة — كافٍ
+        لاكتشاف مسافات زائدة، قيم منعكسة (client/secret)، أو نسخ ناقص."""
+        if len(value) <= 10:
+            return f"(قصير جدًا — طوله {len(value)} حرف فقط، غالبًا خطأ)"
+        return f"{value[:4]}...{value[-4:]} (الطول: {len(value)} حرف)"
+
     is_sandbox = "sandbox" in PAYPAL_API_BASE
     try:
         # نفرّغ التوكن المخزّن مؤقتًا كي نضمن محاولة اتصال فعلية الآن، لا رجوع لنتيجة سابقة.
@@ -1818,6 +1825,8 @@ async def admin_paypal_health(x_admin_token: OptionalHeader = None):
             "message": f"تعذر الاتصال بـ PayPal — راجع صحة المفاتيح. تفاصيل: {exc}",
             "api_base": PAYPAL_API_BASE,
             "mode": "sandbox" if is_sandbox else "live",
+            "client_id_loaded": _mask(PAYPAL_CLIENT_ID),
+            "secret_loaded": _mask(PAYPAL_SECRET),
         }
 
 
