@@ -17,6 +17,7 @@
 import hashlib
 import json
 import os
+import re
 import secrets
 import smtplib
 import time
@@ -164,6 +165,9 @@ PLAN_PRICES_USD = {"basic": 29, "pro": 79, "enterprise": 199}
 TRIAL_DAYS = 7
 PAID_PERIOD_DAYS = 30
 RESET_TOKEN_TTL_MINUTES = 30
+# مدة ضمان استرجاع الأموال المعلنة بالصفحة الرئيسية — يجب أن تطابق هذا
+# الرقم أي نص تسويقي عن الاسترجاع (راجع index.html).
+REFUND_WINDOW_DAYS = 14
 
 FIREBASE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID", "")
 
@@ -213,6 +217,8 @@ PLANS: dict[str, dict] = {
         "monthly_query_limit": 500,
         "max_files": 1,
         "priority": "normal",
+        # الحد الأقصى لعدد الأحرف من الملفات التي تُرسل للذكاء الاصطناعي بكل سؤال.
+        "context_chars": 15000,
     },
     "pro": {
         "price_id": "price_1NxProPlanIDExample",
@@ -220,6 +226,7 @@ PLANS: dict[str, dict] = {
         "monthly_query_limit": None,  # None = غير محدود
         "max_files": 10,
         "priority": "high",
+        "context_chars": 50000,
     },
     "enterprise": {
         "price_id": "price_1NxEnterprisePlanIDExample",
@@ -227,6 +234,7 @@ PLANS: dict[str, dict] = {
         "monthly_query_limit": None,
         "max_files": None,
         "priority": "highest",
+        "context_chars": 120000,
     },
 }
 
@@ -608,12 +616,73 @@ def _company_files(company: dict) -> list[dict]:
     return []
 
 
-# الحد الأقصى الإجمالي لعدد الأحرف من كل ملفات الشركة التي تُرسل للذكاء
-# الاصطناعي بكل سؤال — لضبط تكلفة وسرعة الاستجابة بغض النظر عن عدد الملفات.
-MAX_TOTAL_FILE_CHARS = 12000
+# الحد الافتراضي لعدد الأحرف من الملفات التي تُرسل للذكاء الاصطناعي بكل سؤال،
+# يُستخدم فقط إذا لم تُمرَّر قيمة خاصة بالباقة (راجع context_chars في PLANS).
+DEFAULT_MAX_TOTAL_FILE_CHARS = 15000
+
+# حجم القطعة الواحدة عند تقسيم الملفات الطويلة لاختيار الأجزاء الأكثر صلة بالسؤال.
+_CHUNK_SIZE = 1200
 
 
-def _build_system_prompt(company_name: str, files: list[dict]) -> str:
+def _split_into_chunks(text: str, size: int = _CHUNK_SIZE) -> list[str]:
+    """يقسّم نصًا طويلًا لقطع متقاربة الحجم، مع محاولة القطع عند فواصل الأسطر
+    الفارغة أولًا كي لا تُقطّع الفقرات من منتصفها قدر الإمكان."""
+    paragraphs = [p for p in text.split("\n\n") if p.strip()]
+    chunks: list[str] = []
+    current = ""
+    for para in paragraphs:
+        if len(current) + len(para) + 2 <= size:
+            current = f"{current}\n\n{para}" if current else para
+        else:
+            if current:
+                chunks.append(current)
+            # فقرة أطول من حجم القطعة نفسها: قسّمها قسرًا.
+            while len(para) > size:
+                chunks.append(para[:size])
+                para = para[size:]
+            current = para
+    if current:
+        chunks.append(current)
+    return chunks or ([text] if text else [])
+
+
+def _normalize_ar_word(word: str) -> str:
+    """تبسيط أشكال الحروف العربية الشائعة (الهمزات، التاء المربوطة، "أل"
+    التعريف) كي يُحسب التطابق رغم اختلاف صياغة نفس الكلمة في السؤال والملف."""
+    word = word.translate(str.maketrans("أإآىة", "ااايه"))
+    if len(word) > 4 and word.startswith("ال"):
+        word = word[2:]
+    return word
+
+
+def _extract_words(text: str) -> set[str]:
+    raw = re.findall(r"[\w؀-ۿ]+", text.lower())
+    return {_normalize_ar_word(w) for w in raw if len(w) >= 2}
+
+
+def _keyword_score(chunk: str, question_words: set[str]) -> int:
+    if not question_words:
+        return 0
+    chunk_words = _extract_words(chunk)
+    score = len(question_words & chunk_words)
+    # تطابق جزئي (substring) للكلمات الأطول من 3 أحرف، لتغطية اختلاف صيغ
+    # الجمع/الإضافة الشائعة بالعربية (مثل "الباقات" مقابل "باقاتنا").
+    for qw in question_words:
+        if len(qw) < 4:
+            continue
+        for cw in chunk_words:
+            if len(cw) >= 4 and (qw in cw or cw in qw):
+                score += 1
+                break
+    return score
+
+
+def _build_system_prompt(
+    company_name: str,
+    files: list[dict],
+    question: str = "",
+    max_chars: int = DEFAULT_MAX_TOTAL_FILE_CHARS,
+) -> str:
     prompt = (
         f'أنت مساعد ذكاء اصطناعي خاص بشركة "{company_name}". '
         "أجب على أسئلة العملاء بالاعتماد فقط على المعلومات المتوفرة "
@@ -621,16 +690,39 @@ def _build_system_prompt(company_name: str, files: list[dict]) -> str:
         "مهذبة توضح أنك بحاجة لمزيد من البيانات. "
         "أجب بنفس لغة سؤال المستخدم (عربي أو إنجليزي)."
     )
-    if files:
-        remaining = MAX_TOTAL_FILE_CHARS
-        chunks = []
-        for f in files:
-            if remaining <= 0:
-                break
-            content = f.get("content", "")[:remaining]
-            remaining -= len(content)
-            chunks.append(f"[ملف: {f.get('name', 'بدون اسم')}]\n{content}")
-        prompt += "\n\nبيانات الشركة المرفوعة:\n" + "\n\n".join(chunks)
+    if not files:
+        return prompt
+
+    # نجمع كل الملفات كقطع صغيرة موسومة باسم ملفها الأصلي، ثم نرتبها حسب
+    # صلتها بسؤال المستخدم (تطابق كلمات بسيط) كي لا نكتفي بأخذ بداية
+    # الملفات فقط — بهذا يستفيد السؤال من أي جزء ذي صلة ضمن الملفات، حتى
+    # لو كان في ملف لاحق أو منتصف ملف طويل، بدل تجاهله بصمت.
+    question_words = _extract_words(question)
+    all_chunks: list[tuple[int, int, str]] = []  # (score, ترتيب أصلي, نص)
+    order = 0
+    for f in files:
+        label = f.get("name", "بدون اسم")
+        for piece in _split_into_chunks(f.get("content", "")):
+            score = _keyword_score(piece, question_words)
+            all_chunks.append((score, order, f"[ملف: {label}]\n{piece}"))
+            order += 1
+
+    # ترتيب تنازلي حسب الصلة بالسؤال، مع الحفاظ على ترتيب الملفات الأصلي
+    # عند تساوي الصلة (أو عند عدم وجود كلمات مشتركة، أي سؤال عام).
+    all_chunks.sort(key=lambda c: (-c[0], c[1]))
+
+    remaining = max_chars
+    selected: list[tuple[int, str]] = []
+    for score, order_idx, piece in all_chunks:
+        if remaining <= 0:
+            break
+        piece = piece[:remaining]
+        remaining -= len(piece)
+        selected.append((order_idx, piece))
+
+    # نعيد القطع المختارة لترتيبها الأصلي بالملفات كي يقرأها النموذج بسياق متسلسل منطقي.
+    selected.sort(key=lambda c: c[0])
+    prompt += "\n\nبيانات الشركة المرفوعة:\n" + "\n\n".join(p for _, p in selected)
     return prompt
 
 
@@ -665,7 +757,10 @@ def _call_anthropic(question: str, system_prompt: str) -> str:
 
 
 def generate_ai_answer(
-    question: str, company_name: str, files: list[dict]
+    question: str,
+    company_name: str,
+    files: list[dict],
+    context_chars: int = DEFAULT_MAX_TOTAL_FILE_CHARS,
 ) -> str:
     """يولّد رد الذكاء الاصطناعي أو رد احتياطي إن لم يوجد مفتاح."""
     if not GEMINI_API_KEY and not ANTHROPIC_API_KEY:
@@ -679,7 +774,7 @@ def generate_ai_answer(
             base += "لم يتم رفع أي مستندات بعد لهذه الشركة."
         return base
 
-    system_prompt = _build_system_prompt(company_name, files)
+    system_prompt = _build_system_prompt(company_name, files, question, context_chars)
     try:
         if GEMINI_API_KEY:
             return _call_gemini(question, system_prompt)
@@ -963,6 +1058,19 @@ async def get_me(x_api_key: OptionalHeader = None):
     company = get_company(x_api_key)
     plan = PLANS.get(company["plan"], PLANS["basic"])
     used = company.get("usage", {}).get(current_month_key(), 0)
+
+    refund_eligible = False
+    if (
+        company.get("payment_method") == "paypal"
+        and company.get("paypal_reference")
+        and not company.get("refunded")
+        and company.get("paid_at")
+    ):
+        deadline = datetime.fromisoformat(company["paid_at"]) + timedelta(
+            days=REFUND_WINDOW_DAYS
+        )
+        refund_eligible = datetime.now(timezone.utc) <= deadline
+
     return {
         "company": company["name"],
         "plan": company["plan"],
@@ -974,6 +1082,8 @@ async def get_me(x_api_key: OptionalHeader = None):
         "files_count": len(_company_files(company)),
         "max_files": plan["max_files"],
         "trial_expired": is_trial_expired(company),
+        "refund_eligible": refund_eligible,
+        "refunded": bool(company.get("refunded")),
         **trial_status(company),
         **paid_status(company),
     }
@@ -1007,11 +1117,13 @@ async def ask_ai_assistant(
 
     enforce_plan_limits(company)
 
+    plan = PLANS.get(company["plan"], PLANS["basic"])
     answer = await run_in_threadpool(
         generate_ai_answer,
         payload.question,
         company["name"],
         _company_files(company),
+        plan.get("context_chars", DEFAULT_MAX_TOTAL_FILE_CHARS),
     )
     record_usage(company)
 
@@ -1342,6 +1454,7 @@ async def _activate_paypal_payment(
     payer_email: str, plan: str, reference: str
 ) -> str:
     """يرقّي حساب التجربة الموجود، أو ينشئ حسابًا جديدًا إذا لم يوجد."""
+    now_iso = datetime.now(timezone.utc).isoformat()
     paid_until = (
         datetime.now(timezone.utc) + timedelta(days=PAID_PERIOD_DAYS)
     ).isoformat()
@@ -1356,6 +1469,10 @@ async def _activate_paypal_payment(
             verified=True,
             active=True,
             paid_until=paid_until,
+            # تاريخ هذه الدفعة تحديدًا — أساس حساب أهلية استرجاع الـ 14 يوم،
+            # ويُستبدل عند كل تجديد/ترقية لاحقة بنفس الطريقة.
+            paid_at=now_iso,
+            refunded=False,
         )
         _save_db()
         await run_in_threadpool(
@@ -1394,6 +1511,8 @@ async def _activate_paypal_payment(
         "paypal_reference": reference,
         "verified": True,
         "paid_until": paid_until,
+        "paid_at": now_iso,
+        "refunded": False,
     }
     _save_db()
 
@@ -1531,6 +1650,113 @@ async def claim_paypal_subscription(claim: PaypalClaim):
             "سيصلكم مفتاح API عبر البريد الإلكتروني."
         ),
         "request_id": request_id,
+    }
+
+
+# ---------------------------------------------------------------------------
+# استرجاع الأموال — تطبيق حقيقي لضمان "استرجاع خلال 14 يوم" المُعلن
+# بالصفحة الرئيسية، بدل أن يكون وعدًا بلا غطاء تقني.
+# ---------------------------------------------------------------------------
+def _refund_paypal_capture(capture_id: str) -> dict:
+    """يرسل طلب استرجاع فعلي لـ PayPal لمبلغ الدفعة بالكامل، ويرجع رد PayPal."""
+    token = _get_paypal_access_token()
+    resp = requests.post(
+        f"{PAYPAL_API_BASE}/v2/payments/captures/{capture_id}/refund",
+        json={},  # بلا مبلغ = استرجاع كامل المبلغ المدفوع
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        timeout=20,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+@app.post("/enterprise/request-refund")
+@limiter.limit("5/hour")
+async def request_refund(request: Request, x_api_key: OptionalHeader = None):
+    """يسترجع فعليًا كامل مبلغ آخر دفعة عبر PayPal، إذا كانت ضمن 14 يومًا
+    من الدفع ولم يُسترجع الحساب من قبل. هذا يطبّق تقنيًا نفس ضمان
+    الاسترجاع المعلن بالموقع، بدل أن يبقى وعدًا بدون تنفيذ."""
+    company = get_company(x_api_key)
+
+    if company.get("payment_method") != "paypal" or not company.get(
+        "paypal_reference"
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "لا يوجد دفع مسجّل عبر PayPal على هذا الحساب. "
+                "تواصلوا معنا مباشرة لمعالجة الاسترجاع يدويًا."
+            ),
+        )
+
+    if company.get("refunded"):
+        raise HTTPException(
+            status_code=400, detail="تم استرجاع آخر دفعة على هذا الحساب مسبقًا."
+        )
+
+    paid_at_raw = company.get("paid_at")
+    if not paid_at_raw:
+        raise HTTPException(
+            status_code=400,
+            detail="تعذر تحديد تاريخ الدفع لهذا الحساب. تواصلوا معنا مباشرة.",
+        )
+    paid_at = datetime.fromisoformat(paid_at_raw)
+    deadline = paid_at + timedelta(days=REFUND_WINDOW_DAYS)
+    if datetime.now(timezone.utc) > deadline:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"انتهت مهلة ضمان الاسترجاع ({REFUND_WINDOW_DAYS} يومًا من "
+                "تاريخ الدفع)."
+            ),
+        )
+
+    try:
+        result = await run_in_threadpool(
+            _refund_paypal_capture, company["paypal_reference"]
+        )
+    except requests.RequestException as exc:
+        await run_in_threadpool(
+            send_admin_alert,
+            "فشل تنفيذ طلب استرجاع عبر PayPal — يحتاج معالجة يدوية",
+            (
+                f"عميل طلب استرجاع ({company['name']} / {company.get('email')}) "
+                f"ضمن المهلة المسموحة، لكن طلب الاسترجاع الفعلي عبر PayPal API "
+                f"فشل تقنيًا (خطأ: {exc}).\n"
+                f"مرجع الدفعة: {company['paypal_reference']}\n"
+                "يجب معالجة الاسترجاع يدويًا من لوحة PayPal فورًا."
+            ),
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "تعذر إتمام الاسترجاع تلقائيًا الآن. تم تنبيه فريقنا "
+                "وسنعالج طلبكم يدويًا خلال ساعات."
+            ),
+        ) from exc
+
+    company["refunded"] = True
+    company["active"] = False
+    company["refund_result"] = result
+    company["refunded_at"] = datetime.now(timezone.utc).isoformat()
+    _save_db()
+
+    await run_in_threadpool(
+        send_admin_alert,
+        "تم استرجاع دفعة بنجاح",
+        (
+            f"تم استرجاع دفعة {company['name']} / {company.get('email')} "
+            f"بنجاح عبر PayPal (مرجع: {company['paypal_reference']}). "
+            "تم إلغاء تفعيل الحساب تلقائيًا."
+        ),
+    )
+
+    return {
+        "status": "success",
+        "message": "تم استرجاع كامل المبلغ بنجاح، وسيصلكم التأكيد من PayPal خلال أيام قليلة.",
     }
 
 
