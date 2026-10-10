@@ -1804,5 +1804,65 @@ async def admin_revoke(api_key: str, x_admin_token: OptionalHeader = None):
     }
 
 
+class SimulatePaymentRequest(BaseModel):
+    """جسم طلب محاكاة دفعة — للاختبار فقط (راجع /admin/simulate-paypal-payment)."""
+
+    email: str
+    plan: str = "basic"
+    days_ago: int = 0  # كم يوم مضى منذ "الدفعة"، لاختبار انتهاء مهلة الاسترجاع
+
+
+@app.post("/admin/simulate-paypal-payment")
+async def admin_simulate_paypal_payment(
+    payload: SimulatePaymentRequest, x_admin_token: OptionalHeader = None
+):
+    """[للاختبار فقط] يحاكي دفعة PayPal ناجحة على حساب موجود مسبقًا (تجربة
+    مجانية)، بدون أي دفع فعلي، كي يمكن اختبار منطق الأهلية للاسترجاع
+    (ظهور الزر، مهلة الـ 14 يومًا، حالة "مُسترجع مسبقًا") من لوحة التحكم
+    مباشرة. مرجع الدفعة الناتج وهمي تمامًا — أي محاولة استرجاع فعلي عليه
+    ستفشل من جهة PayPal (الدفعة غير موجودة لديهم أصلًا)؛ هذا متوقع ولا
+    يعني وجود خطأ بالكود. لتأكيد الاسترجاع الفعلي، استخدم دفعة PayPal
+    Sandbox حقيقية بدلًا من هذه النقطة."""
+    _check_admin(x_admin_token)
+
+    if payload.plan not in PLANS:
+        raise HTTPException(status_code=400, detail="الباقة غير صالحة.")
+
+    existing_key, existing = _find_company_by_email(payload.email)
+    if not existing:
+        raise HTTPException(
+            status_code=404,
+            detail="لا يوجد حساب بهذا البريد. أنشئ حساب تجربة مجانية أولًا.",
+        )
+
+    paid_at = (
+        datetime.now(timezone.utc) - timedelta(days=payload.days_ago)
+    ).isoformat()
+    paid_until = (
+        datetime.now(timezone.utc) + timedelta(days=PAID_PERIOD_DAYS)
+    ).isoformat()
+    existing.update(
+        plan=payload.plan,
+        trial=False,
+        active=True,
+        payment_method="paypal",
+        paypal_reference=f"TEST_FAKE_{uuid.uuid4().hex[:12]}",
+        verified=True,
+        paid_until=paid_until,
+        paid_at=paid_at,
+        refunded=False,
+    )
+    _save_db()
+    return {
+        "status": "success",
+        "message": (
+            f"تمت محاكاة دفعة وهمية لحساب {existing['name']} "
+            f"({payload.days_ago} يوم مضى). جرّب الآن تسجيل الدخول "
+            "وشوف هل يظهر زر الاسترجاع بلوحة التحكم كما متوقع."
+        ),
+        "api_key": existing_key,
+    }
+
+
 if __name__ == "__main__":
     uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
