@@ -1784,6 +1784,43 @@ async def admin_list_companies(x_admin_token: OptionalHeader = None):
     return DB_COMPANIES
 
 
+@app.get("/admin/paypal-health")
+async def admin_paypal_health(x_admin_token: OptionalHeader = None):
+    """[تشخيص فقط] يتأكد إن متغيرات PayPal (Client ID / Secret / API Base)
+    صحيحة ومتصلة فعليًا بسيرفرات PayPal، بدون أي عملية دفع أو استرجاع —
+    فقط يحاول جلب توكن دخول. يكشف أكبر سبب فشل شائع: مفتاح خاطئ، أو
+    استخدام بيئة live بدل sandbox (أو العكس) بالغلط."""
+    _check_admin(x_admin_token)
+
+    if not (PAYPAL_CLIENT_ID and PAYPAL_SECRET):
+        return {
+            "status": "not_configured",
+            "message": "PAYPAL_CLIENT_ID أو PAYPAL_SECRET غير معرّفين على Railway.",
+        }
+
+    is_sandbox = "sandbox" in PAYPAL_API_BASE
+    try:
+        # نفرّغ التوكن المخزّن مؤقتًا كي نضمن محاولة اتصال فعلية الآن، لا رجوع لنتيجة سابقة.
+        _paypal_token_cache["token"] = None
+        token = await run_in_threadpool(_get_paypal_access_token)
+        return {
+            "status": "connected",
+            "message": (
+                f"تم الاتصال بنجاح بـ PayPal ({'Sandbox' if is_sandbox else 'Live — حقيقي'})."
+            ),
+            "api_base": PAYPAL_API_BASE,
+            "mode": "sandbox" if is_sandbox else "live",
+            "token_preview": f"{token[:12]}...",
+        }
+    except requests.RequestException as exc:
+        return {
+            "status": "failed",
+            "message": f"تعذر الاتصال بـ PayPal — راجع صحة المفاتيح. تفاصيل: {exc}",
+            "api_base": PAYPAL_API_BASE,
+            "mode": "sandbox" if is_sandbox else "live",
+        }
+
+
 @app.get("/admin/pending-claims")
 async def admin_list_pending(x_admin_token: OptionalHeader = None):
     """يعرض الطلبات بانتظار تأكيد PayPal (حالة طبيعية، ليست مراجعة يدوية)."""
