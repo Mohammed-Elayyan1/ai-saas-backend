@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+stripe
+anthropic
+requests
+python-multipart
+python-dotenv
+pyjwt[crypto]
+psycopg2-binary
+slowapi
+sentry-sdk[fastapi]
+google-auth
+google-api-python-client
