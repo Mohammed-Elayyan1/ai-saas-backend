@@ -1487,7 +1487,11 @@ async def get_me(request: Request, x_api_key: OptionalHeader = None):
     plan = PLANS.get(company["plan"], PLANS["basic"])
     used = company.get("usage", {}).get(current_month_key(), 0)
     public_token = _ensure_public_token(x_api_key, company)
-    public_chat_url = str(request.base_url).rstrip("/") + f"/chat/{public_token}"
+    # Railway يُنهي TLS عند البروكسي ويمرر الطلب لتطبيقنا كـ http داخليًا،
+    # فـ request.base_url يرجع http:// رغم أن الدومين العام https فقط —
+    # نفرض https دائمًا هنا لتفادي رابط مكسور (Mixed Content) للعميل.
+    base = str(request.base_url).rstrip("/").replace("http://", "https://", 1)
+    public_chat_url = base + f"/chat/{public_token}"
 
     refund_eligible = False
     if (
