@@ -247,7 +247,7 @@ PAYPAL_API_BASE = os.environ.get(
 )
 # يطابق كل باقة بمبلغها (لتحديد الباقة من المبلغ المدفوع فعليًا)
 PLAN_PRICES_USD = {"basic": 29, "pro": 79, "enterprise": 199}
-TRIAL_DAYS = 7
+TRIAL_DAYS = 14
 PAID_PERIOD_DAYS = 30
 RESET_TOKEN_TTL_MINUTES = 30
 # مدة ضمان استرجاع الأموال المعلنة بالصفحة الرئيسية — يجب أن تطابق هذا
@@ -435,6 +435,28 @@ def _save_pending() -> None:
 _init_pg_schema()
 DB_COMPANIES: dict = _load_companies()  # api_key -> company record
 PENDING_CLAIMS: dict = _load_pending()  # request_id -> claim
+
+# فهرس عكسي: public_token -> api_key. التوكن العام مخصص فقط لصفحة المحادثة
+# المستقلة (/chat/{token})، ولا يمنح أي صلاحيات إدارية (عكس x-api-key الذي
+# يسمح بالوصول لـ /enterprise/me والملفات والاسترجاع) — آمن للمشاركة علنًا
+# (Instagram bio، واتساب...) لأن أقصى ما يفعله هو طرح سؤال على مساعد الشركة.
+PUBLIC_TOKENS: dict[str, str] = {
+    company["public_token"]: api_key
+    for api_key, company in DB_COMPANIES.items()
+    if company.get("public_token")
+}
+
+
+def _ensure_public_token(api_key: str, company: dict) -> str:
+    """يرجع توكن المحادثة العامة للشركة، ويولّد واحدًا جديدًا أول مرة فقط."""
+    token = company.get("public_token")
+    if token:
+        return token
+    token = f"pub_{uuid.uuid4().hex}"
+    company["public_token"] = token
+    PUBLIC_TOKENS[token] = api_key
+    _save_db()
+    return token
 
 
 def current_month_key() -> str:
@@ -1459,11 +1481,13 @@ async def delete_company_file(
 # 5) معلومات الحساب
 # ---------------------------------------------------------------------------
 @app.get("/enterprise/me")
-async def get_me(x_api_key: OptionalHeader = None):
+async def get_me(request: Request, x_api_key: OptionalHeader = None):
     """يرجع معلومات الحساب، الاستخدام، وحالة التجربة (للعدّاد)."""
     company = get_company(x_api_key)
     plan = PLANS.get(company["plan"], PLANS["basic"])
     used = company.get("usage", {}).get(current_month_key(), 0)
+    public_token = _ensure_public_token(x_api_key, company)
+    public_chat_url = str(request.base_url).rstrip("/") + f"/chat/{public_token}"
 
     refund_eligible = False
     if (
@@ -1490,6 +1514,7 @@ async def get_me(x_api_key: OptionalHeader = None):
         "trial_expired": is_trial_expired(company),
         "refund_eligible": refund_eligible,
         "refunded": bool(company.get("refunded")),
+        "public_chat_url": public_chat_url,
         **trial_status(company),
         **paid_status(company),
     }
@@ -1498,14 +1523,10 @@ async def get_me(x_api_key: OptionalHeader = None):
 # ---------------------------------------------------------------------------
 # 6) نقطة الأسئلة
 # ---------------------------------------------------------------------------
-@app.post("/enterprise/ask")
-@limiter.limit("20/minute")
-async def ask_ai_assistant(
-    request: Request, payload: QuestionRequest, x_api_key: OptionalHeader = None
-):
-    """يجيب على سؤال العميل مع تطبيق حدود الباقة."""
-    company = get_company(x_api_key)
-
+async def _answer_question_for_company(company: dict, question: str) -> dict:
+    """المنطق المشترك بين /enterprise/ask (مفتاح خاص) و/public/ask (توكن عام
+    لصفحة المحادثة المستقلة) — نفس التحقق من الاشتراك/التجربة/حدود الباقة،
+    ونفس استدعاء الذكاء الاصطناعي، لتفادي ازدواجية المنطق."""
     if not company.get("active", True):
         raise HTTPException(
             status_code=403,
@@ -1516,7 +1537,7 @@ async def ask_ai_assistant(
         raise HTTPException(
             status_code=402,
             detail=(
-                f"انتهت فترتك التجريبية ({TRIAL_DAYS} أيام). "
+                f"انتهت فترتك التجريبية ({TRIAL_DAYS} يومًا). "
                 "يرجى الاشتراك بأحد الباقات للاستمرار."
             ),
         )
@@ -1526,7 +1547,7 @@ async def ask_ai_assistant(
     plan = PLANS.get(company["plan"], PLANS["basic"])
     answer = await run_in_threadpool(
         generate_ai_answer,
-        payload.question,
+        question,
         company["name"],
         _company_files(company),
         plan.get("context_chars", DEFAULT_MAX_TOTAL_FILE_CHARS),
@@ -1538,6 +1559,162 @@ async def ask_ai_assistant(
         "plan": company["plan"],
         "answer": answer,
     }
+
+
+@app.post("/enterprise/ask")
+@limiter.limit("20/minute")
+async def ask_ai_assistant(
+    request: Request, payload: QuestionRequest, x_api_key: OptionalHeader = None
+):
+    """يجيب على سؤال العميل مع تطبيق حدود الباقة (عبر مفتاح API الخاص —
+    للدمج البرمجي أو ويدجت widget.js المضمّن بموقع العميل)."""
+    company = get_company(x_api_key)
+    return await _answer_question_for_company(company, payload.question)
+
+
+@app.post("/public/ask/{token}")
+@limiter.limit("20/minute")
+async def public_ask(request: Request, token: str, payload: QuestionRequest):
+    """نفس /enterprise/ask لكن عبر توكن عام محدود الصلاحية (public_token) —
+    هذا ما تستدعيه صفحة المحادثة المستقلة /chat/{token}. آمن للمشاركة
+    العلنية لأن التوكن لا يمنح أي وصول لبيانات الحساب أو الفوترة، فقط طرح
+    الأسئلة على مساعد هذه الشركة تحديدًا."""
+    api_key = PUBLIC_TOKENS.get(token)
+    if not api_key or api_key not in DB_COMPANIES:
+        raise HTTPException(status_code=404, detail="رابط محادثة غير صالح.")
+    company = DB_COMPANIES[api_key]
+    return await _answer_question_for_company(company, payload.question)
+
+
+@app.get("/chat/{token}", response_class=FastAPIResponse)
+async def public_chat_page(token: str):
+    """صفحة محادثة مستقلة وجاهزة بالكامل (بدون الحاجة لموقع إلكتروني) —
+    تناسب الشركات التي تعمل فقط عبر إنستغرام/واتساب بدون موقع خاص بها.
+    العميل بس يشارك هذا الرابط (في الـ Bio مثلًا) بدل تضمين سكريبت."""
+    api_key = PUBLIC_TOKENS.get(token)
+    if not api_key or api_key not in DB_COMPANIES:
+        return FastAPIResponse(
+            content="<h1>رابط محادثة غير صالح</h1>",
+            status_code=404,
+            media_type="text/html",
+        )
+    company = DB_COMPANIES[api_key]
+    company_name = company.get("name", "NexusAI")
+    html = _PUBLIC_CHAT_PAGE_TEMPLATE.replace(
+        "__COMPANY_NAME__", company_name
+    ).replace("__TOKEN__", token)
+    return FastAPIResponse(content=html, media_type="text/html")
+
+
+_PUBLIC_CHAT_PAGE_TEMPLATE = """<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>__COMPANY_NAME__ — مساعد ذكي</title>
+<style>
+  :root { --bg:#07060f; --bg2:#100d20; --violet:#8b6bff; --violet2:#5b8dff;
+          --text0:#f4f2fb; --text1:#b4aed0; }
+  * { box-sizing: border-box; }
+  body { margin:0; min-height:100vh; background:
+    radial-gradient(ellipse 900px 500px at 15% -10%, rgba(139,107,255,.20), transparent 60%),
+    radial-gradient(ellipse 900px 600px at 110% 10%, rgba(91,141,255,.16), transparent 55%),
+    var(--bg);
+    font-family: Tahoma, Arial, sans-serif; color: var(--text0);
+    display:flex; flex-direction:column; align-items:center; }
+  header { width:100%; max-width:560px; padding:20px 16px 8px; display:flex;
+    align-items:center; gap:10px; }
+  header .dot { width:34px; height:34px; border-radius:10px;
+    background:linear-gradient(135deg, var(--violet), var(--violet2));
+    display:flex; align-items:center; justify-content:center; font-weight:800; }
+  header h1 { font-size:1.05rem; margin:0; }
+  header p { margin:0; font-size:.8rem; color: var(--text1); }
+  #chat { width:100%; max-width:560px; flex:1; padding:12px 16px;
+    overflow-y:auto; display:flex; flex-direction:column; gap:10px; }
+  .msg { max-width:85%; padding:10px 14px; border-radius:14px; line-height:1.7;
+    font-size:.92rem; white-space:pre-wrap; }
+  .msg.user { align-self:flex-end; background:linear-gradient(135deg, var(--violet), var(--violet2));
+    color:#fff; border-bottom-left-radius:4px; }
+  .msg.bot { align-self:flex-start; background:rgba(255,255,255,.06);
+    border:1px solid rgba(255,255,255,.1); border-bottom-right-radius:4px; }
+  #row { width:100%; max-width:560px; padding:12px 16px 20px; display:flex; gap:8px; }
+  #q { flex:1; background:rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.14);
+    border-radius:10px; padding:12px; color:#fff; font-size:.95rem; }
+  #q:focus { outline:1px solid var(--violet); }
+  #send { background:linear-gradient(135deg, var(--violet), var(--violet2));
+    color:#fff; border:none; border-radius:10px; padding:0 18px; font-size:.95rem;
+    cursor:pointer; }
+  #send:disabled { opacity:.6; cursor:default; }
+  footer { font-size:.72rem; color:var(--text1); opacity:.7; padding-bottom:14px; }
+</style>
+</head>
+<body>
+  <header>
+    <div class="dot">N</div>
+    <div>
+      <h1>__COMPANY_NAME__</h1>
+      <p>مساعد ذكي — بيرد عليك فورًا</p>
+    </div>
+  </header>
+  <div id="chat"></div>
+  <div id="row">
+    <input id="q" type="text" placeholder="اكتب سؤالك هنا...">
+    <button id="send">إرسال</button>
+  </div>
+  <footer>Powered by NexusAI</footer>
+<script>
+(function () {
+  var token = "__TOKEN__";
+  var chat = document.getElementById("chat");
+  var input = document.getElementById("q");
+  var btn = document.getElementById("send");
+
+  function addMsg(text, who) {
+    var div = document.createElement("div");
+    div.className = "msg " + who;
+    div.textContent = text;
+    chat.appendChild(div);
+    chat.scrollTop = chat.scrollHeight;
+  }
+
+  addMsg("أهلًا! كيف أقدر أساعدك اليوم؟", "bot");
+
+  async function send() {
+    var question = input.value.trim();
+    if (!question) return;
+    addMsg(question, "user");
+    input.value = "";
+    btn.disabled = true;
+    addMsg("...جاري الكتابة", "bot");
+    try {
+      var resp = await fetch("/public/ask/" + token, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question: question }),
+      });
+      var data = await resp.json();
+      chat.removeChild(chat.lastChild);
+      if (!resp.ok) {
+        addMsg(data.detail || "تعذر إرسال سؤالك، حاول مرة أخرى.", "bot");
+      } else {
+        addMsg(data.answer, "bot");
+      }
+    } catch (e) {
+      chat.removeChild(chat.lastChild);
+      addMsg("تعذر إرسال سؤالك، تحقق من الاتصال وحاول مرة أخرى.", "bot");
+    }
+    btn.disabled = false;
+    input.focus();
+  }
+
+  btn.addEventListener("click", send);
+  input.addEventListener("keydown", function (e) {
+    if (e.key === "Enter") send();
+  });
+})();
+</script>
+</body>
+</html>"""
 
 
 # ---------------------------------------------------------------------------
