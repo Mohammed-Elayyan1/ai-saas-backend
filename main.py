@@ -1203,19 +1203,26 @@ def generate_ai_answer(
         return base
 
     system_prompt = _build_system_prompt(company_name, files, question, context_chars)
-    try:
-        if GEMINI_API_KEY:
-            return _call_gemini(question, system_prompt)
-        return _call_anthropic(question, system_prompt)
-    except (
-        requests.RequestException,
-        anthropic.APIError,
-        KeyError,
-        IndexError,
-        ValueError,
-    ) as exc:
-        print(f"⚠️  خطأ من مزود الذكاء الاصطناعي: {exc}")
-        return "عذرًا، حدث خطأ أثناء توليد الرد الذكي. حاول لاحقًا."
+    # نجرّب المزوّدين المتاحين بالترتيب؛ إذا فشل الأول (مهلة/خطأ) ننتقل للتالي بدل إرجاع خطأ للعميل.
+    providers = []
+    if GEMINI_API_KEY:
+        providers.append(("Gemini", _call_gemini))
+    if ANTHROPIC_API_KEY:
+        providers.append(("Anthropic", _call_anthropic))
+
+    for name, call in providers:
+        try:
+            return call(question, system_prompt)
+        except (
+            requests.RequestException,
+            anthropic.APIError,
+            KeyError,
+            IndexError,
+            ValueError,
+        ) as exc:
+            print(f"⚠️  خطأ من مزود الذكاء الاصطناعي ({name}): {exc}")
+
+    return "عذرًا، حدث خطأ أثناء توليد الرد الذكي. حاول لاحقًا."
 
 
 # ---------------------------------------------------------------------------
@@ -2488,4 +2495,4 @@ async def admin_simulate_paypal_payment(
 
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)سس
