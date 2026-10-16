@@ -116,9 +116,13 @@ app.add_middleware(
 OptionalHeader = Annotated[str | None, Header()]
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 async def health_check():
-    """نقطة فحص بسيطة للتأكد أن الخادم شغال."""
+    """نقطة فحص بسيطة للتأكد أن الخادم شغال.
+
+    تقبل HEAD أيضًا لأن UptimeRobot (وخدمات مراقبة أخرى) ترسل HEAD بدل GET،
+    وبدونها كان السيرفر يرد 405 فيظهر "Down" رغم أنه شغال.
+    """
     return {"status": "ok", "service": "Enterprise AI SaaS Backend"}
 
 
