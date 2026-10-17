@@ -1729,7 +1729,10 @@ async def _answer_question_for_company(
         # لا نحتسب على العميل سؤالًا فشل توليد رده. الاستهلاك + سجل المحادثة
         # يُحفظان بعملية واحدة (شركة واحدة فقط) بدل إعادة كتابة كل الشركات.
         record_usage(company, save=False)
-        _log_turn(company, sid, source, question, result)
+        # جلسات "test-" تأتي من زر التجربة في لوحة التحكم: نحسبها استهلاكًا فقط
+        # ولا نسجّلها كمحادثات زبائن حتى لا تلوّث الإحصائيات.
+        if not sid.startswith("test-"):
+            _log_turn(company, sid, source, question, result)
         _save_company(api_key)
 
     return {
