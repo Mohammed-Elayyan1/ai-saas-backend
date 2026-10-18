@@ -3228,6 +3228,33 @@ async def admin_revoke(api_key: str, x_admin_token: OptionalHeader = None):
     }
 
 
+class ExtendTrialRequest(BaseModel):
+    email: str
+    days: int = 30
+
+
+@app.post("/admin/extend-trial")
+async def admin_extend_trial(
+    payload: ExtendTrialRequest, x_admin_token: OptionalHeader = None
+):
+    """يمدّد التجربة المجانية لحساب (مثلًا حساب العرض التجريبي) من الآن لعدد
+    أيام محدد. للأدمن فقط، ولا يمسّ الحسابات المدفوعة."""
+    _check_admin(x_admin_token)
+    days = max(1, min(int(payload.days), 365))
+    api_key, company = _find_company_by_email(payload.email)
+    if not api_key:
+        raise HTTPException(status_code=404, detail="لا يوجد حساب بهذا البريد.")
+    if company.get("payment_method"):
+        raise HTTPException(status_code=400, detail="الحساب مدفوع، لا يحتاج تمديدًا.")
+    ends = datetime.now(timezone.utc) + timedelta(days=days)
+    company["trial"] = True
+    company["trial_ends_at"] = ends.isoformat()
+    company["active"] = True
+    company["trial_reminder_sent"] = False
+    _save_company(api_key)
+    return {"status": "success", "trial_ends_at": company["trial_ends_at"]}
+
+
 class SimulatePaymentRequest(BaseModel):
     """جسم طلب محاكاة دفعة — للاختبار فقط (راجع /admin/simulate-paypal-payment)."""
 
