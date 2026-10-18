@@ -1,8 +1,11 @@
 /*
  * NexusAI — ويدجت المحادثة القابل للتضمين.
- * ضع هذا السطر قبل إغلاق </body> بموقعكم، وغيّر data-api-key لمفتاحكم الخاص:
+ * ضع هذا السطر قبل إغلاق </body> بموقعكم (انسخه جاهزًا من لوحة التحكم):
  *
- *   <script src="https://YOUR-BACKEND-DOMAIN/widget.js" data-api-key="YOUR_API_KEY"></script>
+ *   <script src="https://YOUR-BACKEND-DOMAIN/widget.js" data-token="pub_..."></script>
+ *
+ * data-token هو "التوكن العام": آمن لوضعه بكود الموقع لأنه يسمح فقط بطرح
+ * الأسئلة وترك رقم زبون. أما مفتاح الـ API الخاص فلا يوضع هنا أبدًا.
  *
  * لا حاجة لأي تثبيت أو خادم إضافي — الملف يُخدَّم مباشرة من نفس سيرفر NexusAI.
  *
@@ -10,7 +13,7 @@
  */
 (function () {
     var scriptTag = document.currentScript;
-    var apiKey = scriptTag ? scriptTag.getAttribute("data-api-key") : null;
+    var token = scriptTag ? scriptTag.getAttribute("data-token") : null;
     var apiBase = scriptTag
         ? new URL(scriptTag.src).origin
         : "";
@@ -18,8 +21,8 @@
         (document.documentElement.lang || "ar").slice(0, 2);
     var isAr = lang !== "en";
 
-    if (!apiKey) {
-        console.warn("NexusAI widget: data-api-key مفقود على سطر التضمين.");
+    if (!token || token.indexOf("pub_") !== 0) {
+        console.warn("NexusAI widget: data-token مفقود. انسخ سطر التضمين الجديد من لوحة التحكم.");
         return;
     }
 
@@ -40,6 +43,8 @@
             leadNeedPhone: "الرجاء كتابة رقم الهاتف.",
             leadFail: "تعذر الإرسال، حاول مرة أخرى.",
             leadThanks: "شكرًا لك! وصلتنا بياناتك وسيتواصل معك فريقنا قريبًا. ✅",
+            privacy: "محادثتك تُحفظ ويطّلع عليها صاحب الموقع فقط. لا تكتب كلمات سر أو بيانات بطاقات.",
+            leadNote: "بياناتك تصل لصاحب الموقع فقط ليتواصل معك.",
         }
         : {
             bubble: "💬",
@@ -57,6 +62,8 @@
             leadNeedPhone: "Please enter your phone number.",
             leadFail: "Couldn't send, please try again.",
             leadThanks: "Thank you! We received your details and will contact you soon. ✅",
+            privacy: "Your chat is saved and visible to the site owner only. Don't share passwords or card details.",
+            leadNote: "Your details go to the site owner only, to contact you.",
         };
 
     var style = document.createElement("style");
@@ -86,6 +93,8 @@
         ".nexusai-leadbox button{background:#6d4aff;color:#fff;border:none;border-radius:6px;padding:7px;" +
         "font-size:13px;cursor:pointer;}" +
         ".nexusai-leadbox .err{color:#ffb4b4;font-size:12px;}" +
+        "#nexusai-widget-privacy{font-size:10px;color:#9d96c9;padding:4px 12px 0;line-height:1.4;}" +
+        "#nexusai-widget-privacy a{color:inherit;}" +
         "#nexusai-widget-inputrow{display:flex;border-top:1px solid rgba(255,255,255,.1);padding:8px;gap:6px;}" +
         "#nexusai-widget-input{flex:1;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);" +
         "border-radius:8px;padding:8px;color:#fff;font-size:13px;}" +
@@ -103,6 +112,7 @@
         '<div id="nexusai-widget-header"></div>' +
         '<div id="nexusai-widget-messages"></div>' +
         '<button id="nexusai-widget-leadlink" type="button"></button>' +
+        '<div id="nexusai-widget-privacy"></div>' +
         '<div id="nexusai-widget-inputrow">' +
         '<input id="nexusai-widget-input" type="text">' +
         '<button id="nexusai-widget-sendbtn"></button>' +
@@ -119,6 +129,7 @@
     inputEl.placeholder = T.placeholder;
     sendBtn.textContent = T.send;
     leadLinkEl.textContent = T.leadLink;
+    panel.querySelector("#nexusai-widget-privacy").textContent = T.privacy;
 
     var opened = false;
     var greeting = T.greeting;
@@ -140,9 +151,7 @@
     function loadConfig() {
         if (configLoaded) return Promise.resolve();
         configLoaded = true;
-        return fetch(apiBase + "/enterprise/widget-config", {
-            headers: { "x-api-key": apiKey },
-        })
+        return fetch(apiBase + "/public/config/" + encodeURIComponent(token))
             .then(function (r) { return r.ok ? r.json() : null; })
             .then(function (cfg) { if (cfg && cfg.greeting) greeting = cfg.greeting; })
             .catch(function () { });
@@ -184,10 +193,10 @@
             err.textContent = "";
             if (!phoneIn.value.trim()) { err.textContent = T.leadNeedPhone; return; }
             go.disabled = true;
-            fetch(apiBase + "/enterprise/lead", {
+            fetch(apiBase + "/public/lead/" + encodeURIComponent(token), {
                 method: "POST",
-                headers: { "Content-Type": "application/json", "x-api-key": apiKey },
-                body: JSON.stringify({ name: nameIn.value, phone: phoneIn.value, session_id: sid }),
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ name: nameIn.value, phone: phoneIn.value, session_id: sid, channel: "widget" }),
             })
                 .then(function (r) {
                     return r.json().catch(function () { return null; }).then(function (d) {
@@ -205,9 +214,13 @@
                 })
                 .catch(function () { err.textContent = T.leadFail; go.disabled = false; });
         });
+        var note = document.createElement("div");
+        note.style.cssText = "font-size:11px;opacity:.7";
+        note.textContent = T.leadNote;
         box.appendChild(title);
         box.appendChild(nameIn);
         box.appendChild(phoneIn);
+        box.appendChild(note);
         box.appendChild(err);
         box.appendChild(go);
         messagesEl.appendChild(box);
@@ -224,13 +237,10 @@
         var thinkingDiv = addMessage(T.thinking, "bot");
 
         try {
-            var res = await fetch(apiBase + "/enterprise/ask", {
+            var res = await fetch(apiBase + "/public/ask/" + encodeURIComponent(token), {
                 method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                    "x-api-key": apiKey,
-                },
-                body: JSON.stringify({ question: question, session_id: sid }),
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ question: question, session_id: sid, channel: "widget" }),
             });
             var data = await res.json().catch(function () { return null; });
             thinkingDiv.textContent =
