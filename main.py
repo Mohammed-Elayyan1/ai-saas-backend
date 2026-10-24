@@ -3037,12 +3037,63 @@ async def claim_paypal_subscription(claim: PaypalClaim):
 # استرجاع الأموال — تطبيق حقيقي لضمان "استرجاع خلال 14 يوم" المُعلن
 # بالصفحة الرئيسية، بدل أن يكون وعدًا بلا غطاء تقني.
 # ---------------------------------------------------------------------------
-def _refund_paypal_capture(capture_id: str) -> dict:
-    """يرسل طلب استرجاع فعلي لـ PayPal لمبلغ الدفعة بالكامل، ويرجع رد PayPal."""
+def _paypal_capture_net(capture_id: str, token: str) -> dict | None:
+    """يجلب من PayPal تفصيل الدفعة: الإجمالي، رسوم معالجة الدفع، والصافي الذي
+    استلمناه فعلًا. يرجع None إذا تعذّر الجلب أو لم تكن هناك رسوم واضحة،
+    وعندها يُسترجع كامل المبلغ لصالح العميل (الخيار الأكثر أمانًا للعميل)."""
+    try:
+        resp = requests.get(
+            f"{PAYPAL_API_BASE}/v2/payments/captures/{capture_id}",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        bd = data.get("seller_receivable_breakdown") or {}
+        gross = bd.get("gross_amount") or data.get("amount") or {}
+        fee = bd.get("paypal_fee") or {}
+        net = bd.get("net_amount") or {}
+        currency = gross.get("currency_code")
+        gross_v = float(gross.get("value"))
+        fee_v = float(fee.get("value") or 0)
+        net_v = (
+            float(net.get("value")) if net.get("value") is not None else gross_v - fee_v
+        )
+        same_currency = (
+            currency
+            and fee.get("currency_code", currency) == currency
+            and net.get("currency_code", currency) == currency
+        )
+        if not same_currency or gross_v <= 0 or fee_v <= 0 or not (0 < net_v < gross_v):
+            return None
+        return {
+            "currency": currency,
+            "gross": round(gross_v, 2),
+            "fee": round(fee_v, 2),
+            "net": round(net_v, 2),
+        }
+    except (requests.RequestException, ValueError, TypeError):
+        return None
+
+
+def _refund_paypal_capture(capture_id: str) -> tuple[dict, dict | None]:
+    """يرسل طلب استرجاع فعلي لـ PayPal. يسترجع المبلغ بعد خصم رسوم معالجة
+    الدفع التي فرضها PayPal (المعلنة بالشروط). إذا تعذّر معرفة الرسوم يسترجع
+    كامل المبلغ. يرجع (رد PayPal، تفصيل الرسوم أو None)."""
     token = _get_paypal_access_token()
+    info = _paypal_capture_net(capture_id, token)
+    body: dict = {}
+    if info:
+        body = {
+            "amount": {
+                "currency_code": info["currency"],
+                "value": f"{info['net']:.2f}",
+            },
+            "note_to_payer": "Refund minus payment-processing fees, per our terms.",
+        }
     resp = requests.post(
         f"{PAYPAL_API_BASE}/v2/payments/captures/{capture_id}/refund",
-        json={},  # بلا مبلغ = استرجاع كامل المبلغ المدفوع
+        json=body,  # {} = استرجاع كامل المبلغ (حالة تعذّر معرفة الرسوم)
         headers={
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
@@ -3050,15 +3101,15 @@ def _refund_paypal_capture(capture_id: str) -> dict:
         timeout=20,
     )
     resp.raise_for_status()
-    return resp.json()
+    return resp.json(), info
 
 
 @app.post("/enterprise/request-refund")
 @limiter.limit("5/hour")
 async def request_refund(request: Request, x_api_key: OptionalHeader = None):
-    """يسترجع فعليًا كامل مبلغ آخر دفعة عبر PayPal، إذا كانت ضمن 14 يومًا
-    من الدفع ولم يُسترجع الحساب من قبل. هذا يطبّق تقنيًا نفس ضمان
-    الاسترجاع المعلن بالموقع، بدل أن يبقى وعدًا بدون تنفيذ."""
+    """يسترجع فعليًا مبلغ آخر دفعة عبر PayPal بعد خصم رسوم معالجة الدفع
+    (كما هو معلن بالشروط)، إذا كانت ضمن 14 يومًا من الدفع ولم يُسترجع
+    الحساب من قبل. هذا يطبّق تقنيًا نفس الضمان المعلن بالموقع."""
     company = get_company(x_api_key)
 
     if company.get("payment_method") != "paypal" or not company.get(
@@ -3095,7 +3146,7 @@ async def request_refund(request: Request, x_api_key: OptionalHeader = None):
         )
 
     try:
-        result = await run_in_threadpool(
+        result, fee_info = await run_in_threadpool(
             _refund_paypal_capture, company["paypal_reference"]
         )
     except requests.RequestException as exc:
@@ -3121,21 +3172,36 @@ async def request_refund(request: Request, x_api_key: OptionalHeader = None):
     company["active"] = False
     company["refund_result"] = result
     company["refunded_at"] = datetime.now(timezone.utc).isoformat()
+    company["refund_fee_withheld"] = fee_info["fee"] if fee_info else 0
+    company["refund_amount"] = fee_info["net"] if fee_info else None
     _save_db()
+
+    if fee_info:
+        detail = (
+            f"المبلغ المُسترجع {fee_info['net']:.2f} {fee_info['currency']} "
+            f"(بعد خصم رسوم معالجة الدفع {fee_info['fee']:.2f} {fee_info['currency']})."
+        )
+    else:
+        detail = "تعذّر تحديد رسوم PayPal فاستُرجع كامل المبلغ."
 
     alert_admin_fire_and_forget(
         "تم استرجاع دفعة بنجاح",
         (
             f"تم استرجاع دفعة {company['name']} / {company.get('email')} "
             f"بنجاح عبر PayPal (مرجع: {company['paypal_reference']}). "
-            "تم إلغاء تفعيل الحساب تلقائيًا."
+            f"{detail} تم إلغاء تفعيل الحساب تلقائيًا."
         ),
     )
 
-    return {
-        "status": "success",
-        "message": "تم استرجاع كامل المبلغ بنجاح، وسيصلكم التأكيد من PayPal خلال أيام قليلة.",
-    }
+    if fee_info:
+        message = (
+            f"تم استرجاع {fee_info['net']:.2f} {fee_info['currency']} "
+            f"بعد خصم رسوم معالجة الدفع ({fee_info['fee']:.2f} {fee_info['currency']}) "
+            "التي يفرضها PayPal. سيصلكم التأكيد من PayPal خلال أيام قليلة."
+        )
+    else:
+        message = "تم استرجاع المبلغ بنجاح، وسيصلكم التأكيد من PayPal خلال أيام قليلة."
+    return {"status": "success", "message": message}
 
 
 # ---------------------------------------------------------------------------
@@ -3160,6 +3226,26 @@ async def admin_list_companies(x_admin_token: OptionalHeader = None):
     """يعرض كل الشركات."""
     _check_admin(x_admin_token)
     return DB_COMPANIES
+
+
+@app.get("/admin/export")
+async def admin_export(x_admin_token: OptionalHeader = None):
+    """نسخة احتياطية كاملة (حسابات + طلبات دفع معلّقة) كملف JSON قابل
+    للتنزيل. تحتوي مفاتيح API وبيانات عملاء، فاحفظها بمكان خاص ولا تشاركها."""
+    _check_admin(x_admin_token)
+    now = datetime.now(timezone.utc)
+    payload = {
+        "exported_at": now.isoformat(),
+        "companies_count": len(DB_COMPANIES),
+        "companies": DB_COMPANIES,
+        "pending_claims": PENDING_CLAIMS,
+    }
+    filename = f"nexusai-backup-{now.strftime('%Y%m%d-%H%M%S')}.json"
+    return FastAPIResponse(
+        content=json.dumps(payload, ensure_ascii=False, default=str, indent=2),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.get("/admin/paypal-health")
